@@ -1,5 +1,6 @@
 // Pearls Bot - Komplettscript
 // Grundlage: aktuelles CaffeeContainer-Script, angepasst auf den neuen Pearls-Discord.
+// Update: 3-Stunden-Pflicht entfernt, Bungalow-Buchungen ergänzt, Status gesetzt.
 // Wichtig: DISCORD_TOKEN, CLIENT_ID, GUILD_ID und DATABASE_URL in der .env eintragen.
 
 if (process.env.NODE_ENV !== "production") require("dotenv").config();
@@ -83,6 +84,9 @@ const PERSONAL_FILES_CHANNEL_ID = "1512314182299816049";
 const STATISTICS_WEEKLY_CHANNEL_ID = "1512314182299816050";
 const MANAGER_CHAT_CHANNEL_ID = "1512314181259366547";
 
+const BOOKING_REQUEST_CHANNEL_ID = "1512409329771221075";
+const BOOKING_CONFIRMED_CHANNEL_ID = "1512409661029224488";
+
 const TERMINATION_REMOVE_ROLE_IDS = [
   EMPLOYEE_ROLE_ID,
   TEAMUPDATE_EMPLOYEE_ROLE_ID,
@@ -97,7 +101,6 @@ const REGISTRATION_ROLE_IDS = [
 // =====================
 // EINSTELLUNGEN
 // =====================
-const MIN_WEEKLY_MINUTES = 180;
 const PROBE_RANKUP_MINUTES = 600;
 const REMINDER_AFTER_MS = 2 * 60 * 60 * 1000;
 const REMINDER_RESPONSE_MS = 10 * 60 * 1000;
@@ -431,6 +434,10 @@ async function registerCommands() {
       .setDescription("Sendet das Registrierungs-Panel."),
 
     new SlashCommandBuilder()
+      .setName("buchungspanel")
+      .setDescription("Sendet das Bungalow-Buchungspanel."),
+
+    new SlashCommandBuilder()
       .setName("dashboard")
       .setDescription("Aktualisiert das Live-Dashboard."),
 
@@ -548,7 +555,6 @@ function timeOnlyButton(creatorId) {
 function managementPanelRows() {
   const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId("mgmt_warning_start").setLabel("Verwarnung").setEmoji("⚠️").setStyle(ButtonStyle.Danger),
-    new ButtonBuilder().setCustomId("mgmt_missing_hours_start").setLabel("Fehlende Stunden").setEmoji("⏰").setStyle(ButtonStyle.Danger),
     new ButtonBuilder().setCustomId("mgmt_teamupdate_start").setLabel("Teamupdate").setEmoji("🔄").setStyle(ButtonStyle.Success)
   );
 
@@ -632,6 +638,37 @@ function buildFoodEmbed(data) {
     .setTimestamp();
 }
 
+function bookingButtons() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("booking_confirm").setLabel("Buchung bestätigen").setEmoji("✅").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId("booking_deny").setLabel("Buchung ablehnen").setEmoji("❌").setStyle(ButtonStyle.Danger)
+  );
+}
+
+function bookingPanelButton() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("open_booking_modal").setLabel("Bungalow buchen").setEmoji("🏝️").setStyle(ButtonStyle.Primary)
+  );
+}
+
+function buildBookingEmbed(data) {
+  return new EmbedBuilder()
+    .setColor(data.color || 0x5dade2)
+    .setTitle(`🏝️ Neue Bungalow-Buchung ${data.requestId}`)
+    .addFields(
+      { name: "Gast / Name", value: data.name || "Nicht angegeben" },
+      { name: "Telefonnummer", value: data.phone || "Nicht angegeben" },
+      { name: "Zeitraum", value: data.timeframe || "Nicht angegeben" },
+      { name: "Personen", value: data.people || "Nicht angegeben" },
+      { name: "Bungalow / Wunsch", value: data.wish || "Keine Angabe" },
+      { name: "Status", value: data.status || "⏳ Wartet auf Bestätigung" },
+      { name: "Eingereicht von", value: `<@${data.creatorId}>` },
+      { name: "Letzte Änderung", value: data.lastChange || "Noch keine Änderung" }
+    )
+    .setFooter({ text: "Pearls • Bungalow-Buchungssystem" })
+    .setTimestamp();
+}
+
 // =====================
 // MANAGEMENT SEND
 // =====================
@@ -668,33 +705,6 @@ async function sendWarning(targetUserId, warningRoleId, reason, issuerId) {
       `Name: <@${targetUserId}>\n` +
       `Grund: ${reason}\n` +
       `Verwarnung: <@&${warningRoleId}>\n` +
-      `Ausgestellt von: <@${issuerId}>`
-  );
-}
-
-async function sendMissingHoursWarning(targetUserId, warningRoleId, issuerId) {
-  const guild = await client.guilds.fetch(GUILD_ID);
-  const targetMember = await guild.members.fetch(targetUserId).catch(() => null);
-
-  if (targetMember) {
-    await targetMember.roles.add(warningRoleId, `Verwarnung für fehlende Stunden ausgestellt von ${issuerId}`).catch((err) => {
-      console.error(`❌ Verwarnungsrolle für fehlende Stunden konnte nicht vergeben werden: ${warningRoleId}`, err);
-    });
-  }
-
-  await query(
-    `
-    INSERT INTO warning_records (user_id, warning_role_id, issuer_id, reason)
-    VALUES ($1, $2, $3, $4);
-    `,
-    [targetUserId, warningRoleId, issuerId, "Fehlende Stunden"]
-  );
-
-  await sendManagementMessage(
-    `**⏰FEHLENDE STUNDEN⏰**\n` +
-      `Name: <@${targetUserId}>\n` +
-      `Du hast diese Woche deine Stunden nicht erreicht.\n` +
-      `Verwarnung: <@&${warningRoleId}>\n\n` +
       `Ausgestellt von: <@${issuerId}>`
   );
 }
@@ -1251,7 +1261,7 @@ async function checkWarningReviewReminders() {
 }
 
 // =====================
-// WOCHENPRÜFUNG
+// WOCHENRESET
 // =====================
 function getBerlinParts(date = new Date()) {
   const formatter = new Intl.DateTimeFormat("de-DE", {
@@ -1268,47 +1278,7 @@ function getBerlinParts(date = new Date()) {
   return Object.fromEntries(formatter.formatToParts(date).map((p) => [p.type, p.value]));
 }
 
-function getLastWeekRangeUTC() {
-  const now = new Date();
-  const p = getBerlinParts(now);
-
-  const today = new Date(Date.UTC(Number(p.year), Number(p.month) - 1, Number(p.day)));
-  const utcDay = today.getUTCDay();
-  const diffToThisMonday = utcDay === 0 ? -6 : 1 - utcDay;
-
-  const monday = new Date(today);
-  monday.setUTCDate(today.getUTCDate() + diffToThisMonday - 7);
-
-  const sunday = new Date(monday);
-  sunday.setUTCDate(monday.getUTCDate() + 6);
-
-  return { monday: monday.toISOString().slice(0, 10), sunday: sunday.toISOString().slice(0, 10) };
-}
-
-async function getAbsenceStatus(userId, weekFrom, weekTo) {
-  const res = await query(
-    `
-    SELECT *
-    FROM absences
-    WHERE user_id = $1
-      AND date_from <= $3
-      AND date_to >= $2;
-    `,
-    [userId, weekFrom, weekTo]
-  );
-
-  if (!res.rows.length) return "none";
-
-  const full = res.rows.some((a) => {
-    const from = new Date(a.date_from).toISOString().slice(0, 10);
-    const to = new Date(a.date_to).toISOString().slice(0, 10);
-    return from <= weekFrom && to >= weekTo;
-  });
-
-  return full ? "full" : "partial";
-}
-
-async function weeklyMinimumCheckAndReset() {
+async function weeklyResetOnly() {
   const p = getBerlinParts();
   const todayKey = `${p.year}-${p.month}-${p.day}`;
 
@@ -1317,56 +1287,12 @@ async function weeklyMinimumCheckAndReset() {
   const already = await getSetting("last_weekly_reset", null);
   if (already === todayKey) return;
 
-  const { monday, sunday } = getLastWeekRangeUTC();
-
-  const employees = await query(
-    `
-    SELECT user_id, weekly_minutes
-    FROM employees
-    WHERE left_server = FALSE
-      AND weekly_minutes < $1
-    ORDER BY weekly_minutes ASC;
-    `,
-    [MIN_WEEKLY_MINUTES]
-  );
-
-  const lines = [];
-
-  for (const e of employees.rows) {
-    const status = await getAbsenceStatus(e.user_id, monday, sunday);
-    const missing = MIN_WEEKLY_MINUTES - e.weekly_minutes;
-
-    if (status === "full") {
-      lines.push(`• <@${e.user_id}> — **${formatShortMinutes(e.weekly_minutes)}** ⛔\n↳ Vollständig abgemeldet`);
-    } else if (status === "partial") {
-      lines.push(
-        `• <@${e.user_id}> — **${formatShortMinutes(e.weekly_minutes)}** ⚠️\n↳ Teilweise abgemeldet\n↳ Fehlend: **${formatShortMinutes(missing)}**`
-      );
-    } else {
-      lines.push(`• <@${e.user_id}> — **${formatShortMinutes(e.weekly_minutes)}** ❌\n↳ Fehlend: **${formatShortMinutes(missing)}**`);
-    }
-  }
-
-  if (lines.length) {
-    const channel = await client.channels.fetch(PERSONAL_OVERVIEW_CHANNEL_ID);
-
-    const embed = new EmbedBuilder()
-      .setColor(0xe74c3c)
-      .setTitle("🚨 Wochenübersicht – Mindestarbeitszeit nicht erreicht")
-      .setDescription(
-        `Die folgenden Mitarbeiter haben diese Woche die Mindestarbeitszeit von **3 Stunden** nicht erreicht:\n\n` +
-          lines.join("\n\n") +
-          `\n\n<@&${PERSONAL_MANAGER_ROLE_ID}>`
-      )
-      .setTimestamp();
-
-    await channel.send({ content: `<@&${PERSONAL_MANAGER_ROLE_ID}>`, embeds: [embed] });
-  }
-
   await query(`UPDATE employees SET weekly_minutes = 0`);
   await setSetting("last_weekly_reset", todayKey);
   await setSetting("weekly_page", "0");
   await updateWeeklyWorktimeMessage();
+  await updateDashboardMessage().catch(() => null);
+  await updateWeeklyStatisticsMessage().catch(() => null);
 }
 
 // =====================
@@ -1429,12 +1355,6 @@ async function updateDashboardMessage() {
   `);
   const activeStands = await query(`SELECT COUNT(*)::int AS count FROM active_stands WHERE status = 'active'`).catch(() => ({ rows: [{ count: 0 }] }));
   const employees = await query(`SELECT COUNT(*)::int AS count, COALESCE(AVG(weekly_minutes), 0)::int AS avg_weekly FROM employees WHERE left_server = FALSE`);
-  const underHours = await query(`
-    SELECT COUNT(*)::int AS count
-    FROM employees
-    WHERE left_server = FALSE
-      AND weekly_minutes < $1
-  `, [MIN_WEEKLY_MINUTES]);
   const activeAbsences = await query(`
     SELECT COUNT(*)::int AS count
     FROM absences
@@ -1485,17 +1405,11 @@ async function updateDashboardMessage() {
 
 ` +
           `📊 **Ø Weekly-Zeit**
-└ ${formatShortMinutes(employees.rows[0]?.avg_weekly || 0)}
-
-` +
-          `⚠️ **Unter 3 Stunden**
-└ ${underHours.rows[0]?.count || 0}`,
+└ ${formatShortMinutes(employees.rows[0]?.avg_weekly || 0)}`,
       },
       {
         name: "👩‍💼 **Personal Management — Offene Aufgaben**",
         value:
-          `• Mitarbeiter unter 3h prüfen: **${underHours.rows[0]?.count || 0}**
-` +
           `• Alte Verwarnungen prüfen: **${oldWarnings.rows[0]?.count || 0}**
 ` +
           `• Abmeldungen im Blick behalten: **${weekAbsences.rows[0]?.count || 0}**`,
@@ -1739,8 +1653,6 @@ async function getEmployeeAnalysis(userId) {
   const last = lastSession.rows[0];
 
   let score = 100;
-  if (weekly < 60) score -= 30;
-  else if (weekly < MIN_WEEKLY_MINUTES) score -= 15;
 
   if (activeWarnings >= 2) score -= 30;
   else if (activeWarnings === 1) score -= 15;
@@ -1761,7 +1673,7 @@ async function getEmployeeAnalysis(userId) {
 
   if (score < 50) {
     rating = "🚨 Kritisch";
-    recommendation = "Gespräch führen und Aktivität, Fehlstunden oder Verwarnungen prüfen.";
+    recommendation = "Gespräch führen und Aktivität oder Verwarnungen prüfen.";
     color = 0xe74c3c;
   } else if (score < 75) {
     rating = "⚠️ Beobachten";
@@ -2121,8 +2033,9 @@ function timeUserSelect(customId, placeholder = "Mitarbeiter auswählen") {
 // =====================
 // READY
 // =====================
-client.once("ready", async () => {
+client.once("clientReady", async () => {
   console.log(`✅ Bot ist online als ${client.user.tag}`);
+  client.user.setActivity("Made by Kquwi✞");
 
   try {
     await initDatabase();
@@ -2142,7 +2055,7 @@ client.once("ready", async () => {
     setInterval(updateWeeklyStatisticsMessage, 5 * 60 * 1000);
     setInterval(updateManagementTasksMessage, 5 * 60 * 1000);
     setInterval(sendStockCheckReminderIfNeeded, 60 * 1000);
-    setInterval(weeklyMinimumCheckAndReset, 60 * 1000);
+    setInterval(weeklyResetOnly, 60 * 1000);
     setInterval(checkWarningReviewReminders, 60 * 60 * 1000);
 
     console.log("✅ Stempel-Uhr System gestartet.");
@@ -2295,8 +2208,6 @@ client.on("interactionCreate", async (interaction) => {
               "Verwalte hier das Team des **Pearls**.\n\n" +
               "⚠️ **Verwarnung**\n" +
               "└ Normale Verwarnung ausstellen\n\n" +
-              "⏰ **Fehlende Stunden**\n" +
-              "└ Verwarnung wegen nicht erreichter Wochenstunden\n\n" +
               "🎉 **Teamupdate**\n" +
               "└ Beförderungen und Rollenänderungen\n\n" +
               "📤 **Kündigung**\n" +
@@ -2342,6 +2253,32 @@ client.on("interactionCreate", async (interaction) => {
         );
 
         return interaction.reply({ embeds: [embed], components: [row] });
+      }
+
+      if (interaction.commandName === "buchungspanel") {
+        if (!canCreatePanels(interaction.member)) {
+          return interaction.reply({ content: "❌ Du darfst dieses Panel nicht erstellen.", ephemeral: true });
+        }
+
+        const embed = new EmbedBuilder()
+          .setColor(0x5dade2)
+          .setTitle("🏝️ ・BUNGALOW BUCHUNG")
+          .setDescription(
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+              "Hier können Gäste einen **Bungalow** beim Pearls anfragen.\n\n" +
+              "📌 **Bitte im Formular angeben:**\n" +
+              "└ Name / Gastname\n" +
+              "└ Telefonnummer\n" +
+              "└ Zeitraum\n" +
+              "└ Personenanzahl\n" +
+              "└ Wunsch / Notiz\n\n" +
+              "✅ Nach dem Absenden prüft die Leitung die Buchung.\n" +
+              "━━━━━━━━━━━━━━━━━━━━━━━━"
+          )
+          .setFooter({ text: "Pearls • Bungalow-Buchungssystem" })
+          .setTimestamp();
+
+        return interaction.reply({ embeds: [embed], components: [bookingPanelButton()] });
       }
 
       if (interaction.commandName === "dashboard") {
@@ -2503,7 +2440,6 @@ client.on("interactionCreate", async (interaction) => {
 
       const map = {
         mgmt_warning_user: "warning",
-        mgmt_missing_hours_user: "missing_hours",
         mgmt_teamupdate_user: "teamupdate",
         mgmt_termination_user: "termination",
         mgmt_warning_remove_user: "warning_remove",
@@ -2576,14 +2512,6 @@ client.on("interactionCreate", async (interaction) => {
         draft.warningRoleId = interaction.values[0];
         managementDrafts.set(key, draft);
         return interaction.reply({ content: "✅ Verwarnung gespeichert.", ephemeral: true });
-      }
-
-      if (id === "mgmt_missing_hours_role") {
-        const key = draftKey(interaction.user.id, "missing_hours");
-        const draft = managementDrafts.get(key) || {};
-        draft.warningRoleId = interaction.values[0];
-        managementDrafts.set(key, draft);
-        return interaction.reply({ content: "✅ Verwarnung für fehlende Stunden gespeichert.", ephemeral: true });
       }
 
       if (id === "mgmt_warning_remove_role") {
@@ -2710,20 +2638,6 @@ client.on("interactionCreate", async (interaction) => {
         });
       }
 
-      if (interaction.customId === "mgmt_missing_hours_start") {
-        if (!canManagePersonal(interaction.member)) return interaction.reply({ content: "❌ Du darfst das nicht.", ephemeral: true });
-        managementDrafts.set(draftKey(interaction.user.id, "missing_hours"), {});
-        return interaction.reply({
-          content: "⏰ Wähle den User und die Verwarnung für fehlende Stunden aus. Danach auf **Weiter** klicken.",
-          components: [
-            userSelect("mgmt_missing_hours_user", "User für fehlende Stunden auswählen"),
-            warningRoleSelect("mgmt_missing_hours_role"),
-            continueButton("mgmt_missing_hours_continue"),
-          ],
-          ephemeral: true,
-        });
-      }
-
       if (interaction.customId === "mgmt_teamupdate_start") {
         if (!canManagePersonal(interaction.member)) return interaction.reply({ content: "❌ Du darfst das nicht.", ephemeral: true });
         managementDrafts.set(draftKey(interaction.user.id, "teamupdate"), {});
@@ -2781,17 +2695,6 @@ client.on("interactionCreate", async (interaction) => {
         );
 
         return interaction.showModal(modal);
-      }
-
-      if (interaction.customId === "mgmt_missing_hours_continue") {
-        const draft = managementDrafts.get(draftKey(interaction.user.id, "missing_hours"));
-        if (!draft?.targetUserId || !draft?.warningRoleId) {
-          return interaction.reply({ content: "❌ Bitte User und Verwarnung auswählen.", ephemeral: true });
-        }
-
-        await sendMissingHoursWarning(draft.targetUserId, draft.warningRoleId, interaction.user.id);
-        managementDrafts.delete(draftKey(interaction.user.id, "missing_hours"));
-        return interaction.reply({ content: "✅ Verwarnung für fehlende Stunden wurde gesendet.", ephemeral: true });
       }
 
       if (interaction.customId === "mgmt_teamupdate_continue") {
@@ -3049,6 +2952,47 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.showModal(modal);
       }
 
+      if (interaction.customId === "open_booking_modal") {
+        const modal = new ModalBuilder().setCustomId("booking_modal").setTitle("Bungalow buchen");
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("booking_name").setLabel("Name / Gastname").setPlaceholder("z. B. Max Mustermann").setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("booking_phone").setLabel("Telefonnummer").setPlaceholder("z. B. 555-1234").setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("booking_timeframe").setLabel("Zeitraum").setPlaceholder("z. B. heute 20:00 - 22:00 Uhr").setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("booking_people").setLabel("Personenanzahl").setPlaceholder("z. B. 4 Personen").setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("booking_wish").setLabel("Bungalow / Wunsch / Notiz").setPlaceholder("z. B. Bungalow 2 oder besondere Wünsche").setStyle(TextInputStyle.Paragraph).setRequired(false))
+        );
+        return interaction.showModal(modal);
+      }
+
+      if (interaction.customId === "booking_confirm" || interaction.customId === "booking_deny") {
+        if (!canCreatePanels(interaction.member)) return interaction.reply({ content: "❌ Du darfst Buchungen nicht bearbeiten.", ephemeral: true });
+
+        const confirmed = interaction.customId === "booking_confirm";
+        const oldEmbed = interaction.message.embeds[0];
+        const status = confirmed ? `✅ Gebucht von <@${interaction.user.id}>` : `❌ Abgelehnt von <@${interaction.user.id}>`;
+        const fields = replaceStatusField(oldEmbed, status);
+        const changeIndex = fields.findIndex((f) => f.name === "Letzte Änderung");
+        if (changeIndex >= 0) fields[changeIndex].value = `<@${interaction.user.id}> • <t:${Math.floor(Date.now() / 1000)}:R>`;
+
+        const embed = EmbedBuilder.from(oldEmbed)
+          .setColor(confirmed ? 0x2ecc71 : 0xe74c3c)
+          .setFields(fields);
+
+        await interaction.message.edit({ embeds: [embed], components: [] });
+
+        if (confirmed) {
+          const bookedChannel = await client.channels.fetch(BOOKING_CONFIRMED_CHANNEL_ID).catch(() => null);
+          if (bookedChannel) {
+            const bookedEmbed = EmbedBuilder.from(embed)
+              .setTitle("✅ Bungalow wurde gebucht")
+              .setFooter({ text: "Pearls • Bestätigte Bungalow-Buchungen" });
+            await bookedChannel.send({ embeds: [bookedEmbed] });
+          }
+        }
+
+        return interaction.reply({ content: confirmed ? "✅ Buchung wurde bestätigt und in den gebuchten Channel geschickt." : "❌ Buchung wurde abgelehnt.", ephemeral: true });
+      }
+
       // STATUS BUTTONS
       if (interaction.customId === "stock_checked") {
         if (!hasManagerRole(interaction.member)) {
@@ -3246,6 +3190,33 @@ client.on("interactionCreate", async (interaction) => {
           .setTimestamp();
 
         return interaction.reply({ embeds: [embed], ephemeral: true });
+      }
+
+      if (interaction.customId === "booking_modal") {
+        const name = interaction.fields.getTextInputValue("booking_name");
+        const phone = interaction.fields.getTextInputValue("booking_phone");
+        const timeframe = interaction.fields.getTextInputValue("booking_timeframe");
+        const people = interaction.fields.getTextInputValue("booking_people");
+        const wish = interaction.fields.getTextInputValue("booking_wish") || "Keine Angabe";
+        const requestId = `#${Date.now().toString().slice(-5)}`;
+
+        const channel = await client.channels.fetch(BOOKING_REQUEST_CHANNEL_ID).catch(() => null);
+        if (!channel) {
+          return interaction.reply({ content: "❌ Buchungs-Channel wurde nicht gefunden.", ephemeral: true });
+        }
+
+        const embed = buildBookingEmbed({
+          requestId,
+          creatorId: interaction.user.id,
+          name,
+          phone,
+          timeframe,
+          people,
+          wish,
+        });
+
+        await channel.send({ content: `<@&${MANAGER_ROLE_ID}>`, embeds: [embed], components: [bookingButtons()] });
+        return interaction.reply({ content: "✅ Deine Bungalow-Buchung wurde gesendet.", ephemeral: true });
       }
 
       // MANAGEMENT MODALS
