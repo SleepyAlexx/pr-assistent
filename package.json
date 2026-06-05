@@ -1,0 +1,26 @@
+{
+  "name": "pearls-bot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SleepyAlexx/pr-assistent.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/SleepyAlexx/pr-assistent/issues"
+  },
+  "homepage": "https://github.com/SleepyAlexx/pr-assistent#readme",
+  "dependencies": {
+    "discord.js": "^14.26.4",
+    "dotenv": "^17.2.2",
+    "pg": "^8.21.0"
+  }
+}
