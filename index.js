@@ -38,6 +38,11 @@ const PROBE_ROLE_ID = "1512314173936238652";
 const DUTY_ROLE_ID = "1512314173936238655";
 const PERSONAL_MANAGER_ROLE_ID = "1512314173936238660";
 
+// Leitungsrollen dürfen alle Panels und Management-Funktionen nutzen
+const OWNER_ROLE_ID = "1512314174045294605";
+const CO_OWNER_ROLE_ID = "1512314174045294604";
+const HIGH_COMMAND_ROLE_ID = "1512314174045294603";
+
 const WARNING_ROLE_1_ID = "1512314173844095168";
 const WARNING_ROLE_2_ID = "1512314173844095167";
 const TEAMUPDATE_EMPLOYEE_ROLE_ID = "1512314173936238653";
@@ -127,20 +132,28 @@ async function query(sql, params = []) {
   return pool.query(sql, params);
 }
 
+function hasLeadershipRole(member) {
+  return (
+    member.roles.cache.has(OWNER_ROLE_ID) ||
+    member.roles.cache.has(CO_OWNER_ROLE_ID) ||
+    member.roles.cache.has(HIGH_COMMAND_ROLE_ID)
+  );
+}
+
 function hasManagerRole(member) {
-  return member.roles.cache.has(MANAGER_ROLE_ID);
+  return hasLeadershipRole(member) || member.roles.cache.has(MANAGER_ROLE_ID);
 }
 
 function isPersonalManager(member) {
-  return member.roles.cache.has(PERSONAL_MANAGER_ROLE_ID);
+  return hasLeadershipRole(member) || member.roles.cache.has(PERSONAL_MANAGER_ROLE_ID);
 }
 
 function canCreatePanels(member) {
-  return hasManagerRole(member) || isPersonalManager(member);
+  return hasLeadershipRole(member) || hasManagerRole(member) || isPersonalManager(member);
 }
 
 function canManagePersonal(member) {
-  return hasManagerRole(member) || isPersonalManager(member);
+  return hasLeadershipRole(member) || hasManagerRole(member) || isPersonalManager(member);
 }
 
 function formatMinutes(minutes) {
