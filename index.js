@@ -608,29 +608,24 @@ async function registerCommands() {
       .setDescription("Sendet das Zeitverwaltungs-Panel."),
   ].map((cmd) => cmd.toJSON());
 
-  const rest = new REST({ version: "10", timeout: 15000 }).setToken(TOKEN);
+  const rest = new REST({ version: "10", timeout: 120000 }).setToken(TOKEN);
 
   try {
     // Wichtig: Commands NICHT vorher löschen.
     // Discord überschreibt die Guild-Commands automatisch mit dieser Liste.
-    // So verschwinden die /Commands nicht, falls beim Registrieren mal ein Fehler kommt.
+    // Kein 20-Sekunden-Abbruch mehr: Railway/Discord kann manchmal länger brauchen.
     console.log(`🔄 Slash Commands werden registriert: ${commands.length} Commands für Guild ${GUILD_ID}...`);
 
-    const registerPromise = rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), {
+    await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), {
       body: commands,
     });
 
-    await Promise.race([
-      registerPromise,
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("Slash-Command-Registrierung Timeout nach 20 Sekunden")), 20000)
-      ),
-    ]);
-
     console.log(`✅ Slash Commands registriert: ${commands.length}`);
+    return true;
   } catch (err) {
     console.error("❌ Fehler beim Registrieren der Slash Commands:", err);
-    throw err;
+    console.error("⚠️ Der Bot bleibt online, aber die Slash Commands wurden nicht aktualisiert.");
+    return false;
   }
 }
 
@@ -3011,8 +3006,12 @@ client.once("clientReady", async () => {
   try {
     await initDatabase();
     console.log("🔄 Starte Slash-Command-Registrierung...");
-    await registerCommands();
-    console.log("✅ Slash-Command-Registrierung abgeschlossen.");
+    const commandsOk = await registerCommands();
+    if (commandsOk) {
+      console.log("✅ Slash-Command-Registrierung abgeschlossen.");
+    } else {
+      console.log("⚠️ Slash-Command-Registrierung nicht abgeschlossen. Bot startet trotzdem weiter.");
+    }
     await syncEmployeeRoles();
     await updateTotalWorktimeMessage();
     await updateWeeklyWorktimeMessage();
