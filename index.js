@@ -989,7 +989,8 @@ async function createTicketFromButton(interaction, categoryKey) {
   const thread = await parentChannel.threads.create({
     name: baseName,
     autoArchiveDuration: 1440,
-    type: ChannelType.PublicThread,
+    type: ChannelType.PrivateThread,
+    invitable: false,
     reason: `Ticket erstellt von ${interaction.user.tag}`,
   });
 
