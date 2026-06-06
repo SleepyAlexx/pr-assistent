@@ -5,6 +5,7 @@
 // Update: Ticket-System mit öffentlichen Threads, Claim-System, Add/Remove/Rename/Close/Open Commands ergänzt.
 // Update: Private Ticket-Threads + stabilerer Member-Fetch ohne Query + Debug-Logs im Ticket-Debug-Channel.
 // Update: Ticket-System final stabilisiert: Private Threads, Strict Remove, stabiles Rename/Close, Bürgerrollen blockiert.
+// Update: Geschlossene Tickets werden gelockt/archiviert und nach 2 Tagen automatisch gelöscht.
 // Wichtig: DISCORD_TOKEN, CLIENT_ID, GUILD_ID und DATABASE_URL in der .env eintragen.
 
 if (process.env.NODE_ENV !== "production") require("dotenv").config();
@@ -112,6 +113,7 @@ const TICKET_EVENT_CHANNEL_ID = "1512762866917441617";
 const TICKET_GENERAL_CHANNEL_ID = "1512762899024842803";
 
 const TICKET_CLOSE_AFTER_MS = 2 * 24 * 60 * 60 * 1000;
+const TICKET_DELETE_AFTER_CLOSE_MS = 2 * 24 * 60 * 60 * 1000;
 
 const TERMINATION_REMOVE_ROLE_IDS = [
   EMPLOYEE_ROLE_ID,
@@ -464,6 +466,8 @@ async function initDatabase() {
     );
   `);
 
+  await query(`ALTER TABLE ticket_records ADD COLUMN IF NOT EXISTS delete_after_at TIMESTAMPTZ;`);
+
   await query(`
     CREATE TABLE IF NOT EXISTS ticket_removed_members (
       thread_id TEXT NOT NULL,
@@ -545,7 +549,13 @@ async function registerCommands() {
 
     new SlashCommandBuilder()
       .setName("ticket-open")
-      .setDescription("Öffnet ein archiviertes/geschlossenes Ticket wieder."),
+      .setDescription("Öffnet ein archiviertes/geschlossenes Ticket wieder.")
+      .addStringOption((option) =>
+        option
+          .setName("thread_id")
+          .setDescription("Optional: Thread-ID, wenn du den Command außerhalb des Tickets nutzt")
+          .setRequired(false)
+      ),
 
     new SlashCommandBuilder()
       .setName("dashboard")
@@ -1451,6 +1461,51 @@ async function requestTicketClose(interaction) {
   return interaction.editReply({ content: "✅ Schließungsanfrage wurde gestellt." });
 }
 
+async function archiveTicketForDeletion(thread, ticket, actorId, reasonText) {
+  const deleteAt = new Date(Date.now() + TICKET_DELETE_AFTER_CLOSE_MS);
+  const restoreName = getRestoreTicketName(ticket);
+  const closedName = `closed-${restoreName}`.slice(0, 95);
+
+  await query(
+    `
+    UPDATE ticket_records
+    SET status = 'closed',
+        current_name = $2,
+        close_requested_by = NULL,
+        close_requested_at = NULL,
+        close_deadline_at = NULL,
+        close_message_id = NULL,
+        delete_after_at = $3,
+        updated_at = NOW()
+    WHERE thread_id = $1;
+    `,
+    [ticket.thread_id, restoreName, deleteAt]
+  ).catch((err) => console.error("❌ Ticket-Archiv DB-Update fehlgeschlagen:", err));
+
+  await thread.send({
+    content:
+      `✅ ・TICKET GESCHLOSSEN\n\n` +
+      `${actorId ? `<@${actorId}> hat die Schließung bestätigt.\n` : "Die Schließungsfrist ist abgelaufen.\n"}` +
+      `${reasonText || "Das Ticket wurde geschlossen."}\n\n` +
+      `Der Thread wird jetzt **gelockt und archiviert**.\n` +
+      `Er kann innerhalb von **2 Tagen** mit \`/ticket-open thread_id:${ticket.thread_id}\` wieder geöffnet werden.\n` +
+      `Danach wird er automatisch gelöscht.`,
+    allowedMentions: { users: actorId ? [actorId] : [] },
+  }).catch(() => null);
+
+  await thread.setName(closedName, "Ticket geschlossen").catch((err) => {
+    console.error("❌ Ticket konnte beim Schließen nicht umbenannt werden:", err?.message || err);
+  });
+
+  await thread.setLocked(true, "Ticket geschlossen").catch((err) => {
+    console.error("❌ Ticket konnte nicht gelockt werden:", err?.message || err);
+  });
+
+  await thread.setArchived(true, "Ticket geschlossen").catch((err) => {
+    console.error("❌ Ticket konnte nicht archiviert werden:", err?.message || err);
+  });
+}
+
 async function handleTicketCloseDecision(interaction, closeToken, decision) {
   // Sofort bestätigen, damit die Buttons niemals bei "Anwendung reagiert nicht" hängen bleiben.
   await interaction.deferUpdate().catch(() => null);
@@ -1475,21 +1530,7 @@ async function handleTicketCloseDecision(interaction, closeToken, decision) {
   await interaction.message.edit({ components: disableActionRows(interaction.message.components) }).catch(() => null);
 
   if (decision === "confirm") {
-    await query(`UPDATE ticket_records SET status = 'closed', updated_at = NOW() WHERE thread_id = $1`, [ticket.thread_id]).catch((err) => {
-      console.error("❌ Ticket-Confirm DB-Update fehlgeschlagen:", err);
-    });
-
-    await thread.send({
-      content:
-        `✅ ・TICKET GESCHLOSSEN\n\n` +
-        `<@${interaction.user.id}> hat die Schließung bestätigt.\n` +
-        `Der Thread wird nun gelöscht.`,
-      allowedMentions: { users: [interaction.user.id] },
-    }).catch(() => null);
-
-    setTimeout(() => thread.delete("Ticket-Schließung bestätigt").catch((err) => {
-      console.error("❌ Ticket-Thread konnte nicht gelöscht werden:", err?.message || err);
-    }), 2500);
+    await archiveTicketForDeletion(thread, ticket, interaction.user.id, "Das Ticket wurde vom Ticket-Ersteller bestätigt geschlossen.");
     return;
   }
 
@@ -1503,14 +1544,16 @@ async function handleTicketCloseDecision(interaction, closeToken, decision) {
     `
     UPDATE ticket_records
     SET status = 'open',
+        current_name = $2,
         close_requested_by = NULL,
         close_requested_at = NULL,
         close_deadline_at = NULL,
         close_message_id = NULL,
+        delete_after_at = NULL,
         updated_at = NOW()
     WHERE thread_id = $1;
     `,
-    [ticket.thread_id]
+    [ticket.thread_id, restoreName]
   ).catch((err) => console.error("❌ Ticket-Cancel DB-Update fehlgeschlagen:", err));
 
   const ping = getTicketActorPing(ticket);
@@ -1524,7 +1567,7 @@ async function handleTicketCloseDecision(interaction, closeToken, decision) {
 }
 
 async function checkTicketCloseDeadlines() {
-  const res = await query(
+  const expiredRequests = await query(
     `
     SELECT *
     FROM ticket_records
@@ -1534,19 +1577,41 @@ async function checkTicketCloseDeadlines() {
     `
   ).catch(() => ({ rows: [] }));
 
-  for (const ticket of res.rows) {
+  for (const ticket of expiredRequests.rows) {
     const channel = await client.channels.fetch(ticket.thread_id).catch(() => null);
-    await query(`UPDATE ticket_records SET status = 'closed', updated_at = NOW() WHERE thread_id = $1`, [ticket.thread_id]).catch(() => null);
+    if (channel) {
+      await archiveTicketForDeletion(channel, ticket, null, "Die Schließungsanfrage wurde nicht innerhalb von 2 Tagen beantwortet.");
+    } else {
+      await query(
+        `UPDATE ticket_records SET status = 'closed', delete_after_at = NOW() + INTERVAL '2 days', updated_at = NOW() WHERE thread_id = $1`,
+        [ticket.thread_id]
+      ).catch(() => null);
+    }
+  }
+
+  const deleteReady = await query(
+    `
+    SELECT *
+    FROM ticket_records
+    WHERE status = 'closed'
+      AND delete_after_at IS NOT NULL
+      AND delete_after_at <= NOW();
+    `
+  ).catch(() => ({ rows: [] }));
+
+  for (const ticket of deleteReady.rows) {
+    const channel = await client.channels.fetch(ticket.thread_id).catch(() => null);
 
     if (channel) {
-      await channel.send({
-        content:
-          "🔒 ・TICKET AUTOMATISCH GESCHLOSSEN\n\n" +
-          "Die Schließungsanfrage wurde nicht innerhalb von 2 Tagen beantwortet. Der Thread wird nun gelöscht.",
-      }).catch(() => null);
-
-      setTimeout(() => channel.delete("Ticket-Frist abgelaufen").catch(() => null), 2500);
+      await channel.delete("Geschlossenes Ticket nach 2 Tagen automatisch gelöscht").catch((err) => {
+        console.error("❌ Geschlossenes Ticket konnte nicht automatisch gelöscht werden:", err?.message || err);
+      });
     }
+
+    await query(
+      `UPDATE ticket_records SET status = 'deleted', delete_after_at = NULL, updated_at = NOW() WHERE thread_id = $1`,
+      [ticket.thread_id]
+    ).catch(() => null);
   }
 }
 
@@ -3282,31 +3347,61 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       if (interaction.commandName === "ticket-open") {
-        const ticket = await ensureTicketThread(interaction);
-        if (!ticket) return;
-        if (!canUseTicketStaffCommands(interaction.member, ticket.category)) {
-          return interaction.reply({ content: "❌ Du darfst dieses Ticket nicht wieder öffnen.", ephemeral: true });
-        }
-
         await interaction.deferReply({ ephemeral: false });
 
+        const givenThreadId = interaction.options.getString("thread_id", false);
+        const thread = givenThreadId
+          ? await client.channels.fetch(givenThreadId).catch(() => null)
+          : interaction.channel;
+
+        if (!thread?.isThread?.()) {
+          await interaction.editReply({ content: "❌ Nutze den Command direkt im Ticket-Thread oder gib `thread_id:` an." });
+          return;
+        }
+
+        const ticket = await getOrRecoverTicketFromThread(thread);
+        if (!ticket) {
+          await interaction.editReply({ content: "❌ Dieses Ticket wurde nicht gefunden." });
+          return;
+        }
+
+        if (!canUseTicketStaffCommands(interaction.member, ticket.category)) {
+          await interaction.editReply({ content: "❌ Du darfst dieses Ticket nicht wieder öffnen." });
+          return;
+        }
+
         const restoreName = getRestoreTicketName(ticket);
-        await interaction.channel.setLocked(false).catch(() => null);
-        await interaction.channel.setArchived(false).catch(() => null);
-        await interaction.channel.setName(restoreName, `Ticket wieder geöffnet von ${interaction.user.tag}`).catch(() => null);
+
+        await thread.setArchived(false, "Ticket wieder geöffnet").catch((err) => {
+          console.error("❌ Ticket konnte nicht entarchiviert werden:", err?.message || err);
+        });
+        await thread.setLocked(false, "Ticket wieder geöffnet").catch((err) => {
+          console.error("❌ Ticket konnte nicht entsperrt werden:", err?.message || err);
+        });
+        await thread.setName(restoreName, `Ticket wieder geöffnet von ${interaction.user.tag}`).catch((err) => {
+          console.error("❌ Ticket konnte beim Öffnen nicht umbenannt werden:", err?.message || err);
+        });
+
         await query(
           `
           UPDATE ticket_records
           SET status = 'open',
+              current_name = $2,
               close_requested_by = NULL,
               close_requested_at = NULL,
               close_deadline_at = NULL,
               close_message_id = NULL,
+              delete_after_at = NULL,
               updated_at = NOW()
           WHERE thread_id = $1
           `,
-          [interaction.channel.id]
+          [thread.id, restoreName]
         ).catch((err) => console.error("❌ Ticket-Open DB-Update fehlgeschlagen:", err));
+
+        await thread.send({
+          content: `🔓 ・TICKET WIEDER GEÖFFNET\n\n<@${interaction.user.id}> hat dieses Ticket wieder geöffnet.`,
+          allowedMentions: { users: [interaction.user.id] },
+        }).catch(() => null);
 
         await interaction.editReply({ content: `🔓 <@${interaction.user.id}> hat das Ticket wieder geöffnet.` });
         return;
