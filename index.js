@@ -825,28 +825,41 @@ const TICKET_CATEGORIES = {
 };
 
 const TICKET_STAFF_ROLE_IDS = [
-  PROBE_ROLE_ID,
-  EMPLOYEE_ROLE_ID,
-  TEAMUPDATE_PROBE_EMPLOYEE_ROLE_ID,
-  TEAMUPDATE_EMPLOYEE_ROLE_ID,
-  TEAMUPDATE_EMPLOYEE_BASE_ROLE_ID,
-  TEAMUPDATE_PROBE_MANAGER_ROLE_ID,
-  TEAMUPDATE_MANAGER_ROLE_ID,
-  TEAMUPDATE_PERSONAL_MANAGER_ROLE_ID,
-  TEAMUPDATE_MANAGEMENT_BASE_ROLE_ID,
-  OWNER_ROLE_ID,
-  CO_OWNER_ROLE_ID,
-  HIGH_COMMAND_ROLE_ID,
+  "1512314174045294606",
+  "1512314174045294605",
+  "1512314174045294604",
+  "1512314173936238660",
+  "1512314173936238659",
+  "1512314173936238658",
+  "1512619798234923058",
+  "1512619917915197580",
+  "1512314173936238656",
+  "1512314173936238653",
+  "1512314173936238652",
 ];
 
 const TICKET_MANAGEMENT_ROLE_IDS = [
-  TEAMUPDATE_PROBE_MANAGER_ROLE_ID,
-  TEAMUPDATE_MANAGER_ROLE_ID,
-  TEAMUPDATE_PERSONAL_MANAGER_ROLE_ID,
-  TEAMUPDATE_MANAGEMENT_BASE_ROLE_ID,
-  OWNER_ROLE_ID,
-  CO_OWNER_ROLE_ID,
-  HIGH_COMMAND_ROLE_ID,
+  "1512314174045294606",
+  "1512314174045294605",
+  "1512314174045294604",
+  "1512314173936238660",
+  "1512314173936238659",
+  "1512314173936238658",
+];
+
+// Diese Rollen werden bei jedem neuen Ticket automatisch aktiv zum Thread hinzugefügt.
+const TICKET_AUTO_ADD_ROLE_IDS = [
+  "1512314174045294606",
+  "1512314174045294605",
+  "1512314174045294604",
+  "1512314173936238660",
+  "1512314173936238659",
+  "1512314173936238658",
+  "1512619798234923058",
+  "1512619917915197580",
+  "1512314173936238656",
+  "1512314173936238653",
+  "1512314173936238652",
 ];
 
 function ticketPanelButtons() {
@@ -929,14 +942,17 @@ async function ensureTicketThread(interaction) {
 
 async function addAllowedStaffToThread(thread, categoryKey) {
   const guild = await client.guilds.fetch(GUILD_ID);
-  const members = await guild.members.fetch().catch((err) => {
+
+  // Wichtig: Damit wirklich alle berechtigten User direkt im Thread sind,
+  // werden alle Servermitglieder geladen und User mit den festgelegten Rollen einzeln hinzugefügt.
+  const members = await guild.members.fetch({ force: true }).catch((err) => {
     console.error("❌ Mitglieder konnten für Ticket-Zugriff nicht geladen werden:", err);
     return null;
   });
 
   if (!members) return { added: 0, failed: 0 };
 
-  const allowedRoles = categoryRoles(categoryKey);
+  const allowedRoles = TICKET_AUTO_ADD_ROLE_IDS;
   const added = new Set();
   let failed = 0;
 
@@ -954,7 +970,7 @@ async function addAllowedStaffToThread(thread, categoryKey) {
     }
   }
 
-  console.log(`🎫 Ticket-Zugriff: ${added.size} Teammitglieder hinzugefügt, ${failed} fehlgeschlagen (${categoryKey}).`);
+  console.log(`🎫 Ticket-Zugriff: ${added.size} Teammitglieder automatisch zum Thread hinzugefügt, ${failed} fehlgeschlagen (${categoryKey}).`);
   return { added: added.size, failed };
 }
 
