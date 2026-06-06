@@ -1,6 +1,6 @@
 // Pearls Bot - Komplettscript
 // Grundlage: aktuelles CaffeeContainer-Script, angepasst auf den neuen Pearls-Discord.
-// Update: 3-Stunden-Pflicht entfernt, Bungalow-Buchungen ergänzt, Status gesetzt.
+// Update: 3-Stunden-Pflicht entfernt, Bungalow- & Essensstand-Buchungen ergänzt, Status gesetzt.
 // Wichtig: DISCORD_TOKEN, CLIENT_ID, GUILD_ID und DATABASE_URL in der .env eintragen.
 
 if (process.env.NODE_ENV !== "production") require("dotenv").config();
@@ -435,7 +435,7 @@ async function registerCommands() {
 
     new SlashCommandBuilder()
       .setName("buchungspanel")
-      .setDescription("Sendet das Bungalow-Buchungspanel."),
+      .setDescription("Sendet das Bungalow- und Essensstand-Buchungspanel."),
 
     new SlashCommandBuilder()
       .setName("dashboard")
@@ -647,25 +647,52 @@ function bookingButtons() {
 
 function bookingPanelButton() {
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("open_booking_modal").setLabel("Bungalow buchen").setEmoji("🏝️").setStyle(ButtonStyle.Primary)
+    new ButtonBuilder()
+      .setCustomId("open_bungalow_booking_modal")
+      .setLabel("Bungalow buchen")
+      .setEmoji("🏝️")
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId("open_foodstand_booking_modal")
+      .setLabel("Essensstand buchen")
+      .setEmoji("🍽️")
+      .setStyle(ButtonStyle.Success)
   );
 }
 
 function buildBookingEmbed(data) {
+  const isFoodstand = data.type === "foodstand";
+  const emoji = isFoodstand ? "🍽️" : "🏝️";
+  const bookingName = isFoodstand ? "Essensstand-Buchung" : "Bungalow-Buchung";
+
+  const fields = isFoodstand
+    ? [
+        { name: "Ansprechpartner / Name", value: data.name || "Nicht angegeben" },
+        { name: "Telefonnummer", value: data.phone || "Nicht angegeben" },
+        { name: "Datum & Uhrzeit", value: data.timeframe || "Nicht angegeben" },
+        { name: "Personen / Gäste", value: data.people || "Nicht angegeben" },
+        { name: "Ort / Event / Feier", value: data.location || "Nicht angegeben" },
+        { name: "Essensstand / Wunsch / Notiz", value: data.wish || "Keine Angabe" },
+        { name: "Status", value: data.status || "⏳ Wartet auf Bestätigung" },
+        { name: "Eingereicht von", value: `<@${data.creatorId}>` },
+        { name: "Letzte Änderung", value: data.lastChange || "Noch keine Änderung" },
+      ]
+    : [
+        { name: "Gast / Name", value: data.name || "Nicht angegeben" },
+        { name: "Telefonnummer", value: data.phone || "Nicht angegeben" },
+        { name: "Zeitraum", value: data.timeframe || "Nicht angegeben" },
+        { name: "Personen", value: data.people || "Nicht angegeben" },
+        { name: "Bungalow / Wunsch", value: data.wish || "Keine Angabe" },
+        { name: "Status", value: data.status || "⏳ Wartet auf Bestätigung" },
+        { name: "Eingereicht von", value: `<@${data.creatorId}>` },
+        { name: "Letzte Änderung", value: data.lastChange || "Noch keine Änderung" },
+      ];
+
   return new EmbedBuilder()
-    .setColor(data.color || 0x5dade2)
-    .setTitle(`🏝️ Neue Bungalow-Buchung ${data.requestId}`)
-    .addFields(
-      { name: "Gast / Name", value: data.name || "Nicht angegeben" },
-      { name: "Telefonnummer", value: data.phone || "Nicht angegeben" },
-      { name: "Zeitraum", value: data.timeframe || "Nicht angegeben" },
-      { name: "Personen", value: data.people || "Nicht angegeben" },
-      { name: "Bungalow / Wunsch", value: data.wish || "Keine Angabe" },
-      { name: "Status", value: data.status || "⏳ Wartet auf Bestätigung" },
-      { name: "Eingereicht von", value: `<@${data.creatorId}>` },
-      { name: "Letzte Änderung", value: data.lastChange || "Noch keine Änderung" }
-    )
-    .setFooter({ text: "Pearls • Bungalow-Buchungssystem" })
+    .setColor(data.color || (isFoodstand ? 0xf1c40f : 0x5dade2))
+    .setTitle(`${emoji} Neue ${bookingName} ${data.requestId}`)
+    .addFields(fields)
+    .setFooter({ text: isFoodstand ? "Pearls • Essensstand-Buchungssystem" : "Pearls • Bungalow-Buchungssystem" })
     .setTimestamp();
 }
 
@@ -2262,20 +2289,19 @@ client.on("interactionCreate", async (interaction) => {
 
         const embed = new EmbedBuilder()
           .setColor(0x5dade2)
-          .setTitle("🏝️ ・BUNGALOW BUCHUNG")
+          .setTitle("🏝️🍽️ ・BUCHUNGSPANEL")
           .setDescription(
             "━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-              "Hier können Gäste einen **Bungalow** beim Pearls anfragen.\n\n" +
-              "📌 **Bitte im Formular angeben:**\n" +
-              "└ Name / Gastname\n" +
-              "└ Telefonnummer\n" +
-              "└ Zeitraum\n" +
-              "└ Personenanzahl\n" +
-              "└ Wunsch / Notiz\n\n" +
-              "✅ Nach dem Absenden prüft die Leitung die Buchung.\n" +
+              "Hier können Gäste beim Pearls eine Buchung anfragen.\n\n" +
+              "🏝️ **Bungalow buchen**\n" +
+              "└ Für Aufenthalte, Reservierungen oder private Buchungen.\n\n" +
+              "🍽️ **Essensstand buchen**\n" +
+              "└ Für Events, Feiern oder besondere Veranstaltungen.\n\n" +
+              "📌 **Bitte im passenden Formular alles ausfüllen.**\n" +
+              "✅ Nach dem Absenden prüft die Leitung die Anfrage.\n" +
               "━━━━━━━━━━━━━━━━━━━━━━━━"
           )
-          .setFooter({ text: "Pearls • Bungalow-Buchungssystem" })
+          .setFooter({ text: "Pearls • Buchungssystem" })
           .setTimestamp();
 
         return interaction.reply({ embeds: [embed], components: [bookingPanelButton()] });
@@ -2952,7 +2978,7 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.showModal(modal);
       }
 
-      if (interaction.customId === "open_booking_modal") {
+      if (interaction.customId === "open_booking_modal" || interaction.customId === "open_bungalow_booking_modal") {
         const modal = new ModalBuilder().setCustomId("booking_modal").setTitle("Bungalow buchen");
         modal.addComponents(
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("booking_name").setLabel("Name / Gastname").setPlaceholder("z. B. Max Mustermann").setStyle(TextInputStyle.Short).setRequired(true)),
@@ -2960,6 +2986,18 @@ client.on("interactionCreate", async (interaction) => {
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("booking_timeframe").setLabel("Zeitraum").setPlaceholder("z. B. heute 20:00 - 22:00 Uhr").setStyle(TextInputStyle.Short).setRequired(true)),
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("booking_people").setLabel("Personenanzahl").setPlaceholder("z. B. 4 Personen").setStyle(TextInputStyle.Short).setRequired(true)),
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("booking_wish").setLabel("Bungalow / Wunsch / Notiz").setPlaceholder("z. B. Bungalow 2 oder besondere Wünsche").setStyle(TextInputStyle.Paragraph).setRequired(false))
+        );
+        return interaction.showModal(modal);
+      }
+
+      if (interaction.customId === "open_foodstand_booking_modal") {
+        const modal = new ModalBuilder().setCustomId("foodstand_booking_modal").setTitle("Essensstand buchen");
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("booking_name").setLabel("Ansprechpartner / Name").setPlaceholder("z. B. Max Mustermann").setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("booking_phone").setLabel("Telefonnummer").setPlaceholder("z. B. 555-1234").setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("booking_timeframe").setLabel("Datum & Uhrzeit").setPlaceholder("z. B. Samstag 20:00 - 23:00 Uhr").setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("booking_people").setLabel("Personen / Gäste").setPlaceholder("z. B. ca. 20 Gäste").setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("booking_details").setLabel("Ort / Event / Wunsch / Notiz").setPlaceholder("z. B. Geburtstag am Strand, Essensstand mit Getränken").setStyle(TextInputStyle.Paragraph).setRequired(true))
         );
         return interaction.showModal(modal);
       }
@@ -2983,9 +3021,10 @@ client.on("interactionCreate", async (interaction) => {
         if (confirmed) {
           const bookedChannel = await client.channels.fetch(BOOKING_CONFIRMED_CHANNEL_ID).catch(() => null);
           if (bookedChannel) {
+            const isFoodstandBooking = (oldEmbed.title || "").toLowerCase().includes("essensstand");
             const bookedEmbed = EmbedBuilder.from(embed)
-              .setTitle("✅ Bungalow wurde gebucht")
-              .setFooter({ text: "Pearls • Bestätigte Bungalow-Buchungen" });
+              .setTitle(isFoodstandBooking ? "✅ Essensstand wurde gebucht" : "✅ Bungalow wurde gebucht")
+              .setFooter({ text: isFoodstandBooking ? "Pearls • Bestätigte Essensstand-Buchungen" : "Pearls • Bestätigte Bungalow-Buchungen" });
             await bookedChannel.send({ embeds: [bookedEmbed] });
           }
         }
@@ -3206,6 +3245,7 @@ client.on("interactionCreate", async (interaction) => {
         }
 
         const embed = buildBookingEmbed({
+          type: "bungalow",
           requestId,
           creatorId: interaction.user.id,
           name,
@@ -3217,6 +3257,39 @@ client.on("interactionCreate", async (interaction) => {
 
         await channel.send({ content: `<@&${MANAGER_ROLE_ID}>`, embeds: [embed], components: [bookingButtons()] });
         return interaction.reply({ content: "✅ Deine Bungalow-Buchung wurde gesendet.", ephemeral: true });
+      }
+
+      if (interaction.customId === "foodstand_booking_modal") {
+        const name = interaction.fields.getTextInputValue("booking_name");
+        const phone = interaction.fields.getTextInputValue("booking_phone");
+        const timeframe = interaction.fields.getTextInputValue("booking_timeframe");
+        const people = interaction.fields.getTextInputValue("booking_people");
+        const details = interaction.fields.getTextInputValue("booking_details") || "Keine Angabe";
+        const requestId = `#${Date.now().toString().slice(-5)}`;
+
+        const channel = await client.channels.fetch(BOOKING_REQUEST_CHANNEL_ID).catch(() => null);
+        if (!channel) {
+          return interaction.reply({ content: "❌ Buchungs-Channel wurde nicht gefunden.", ephemeral: true });
+        }
+
+        const [locationRaw, ...wishParts] = details.split(";");
+        const location = locationRaw?.trim() || "Siehe Notiz";
+        const wish = wishParts.join(";").trim() || details;
+
+        const embed = buildBookingEmbed({
+          type: "foodstand",
+          requestId,
+          creatorId: interaction.user.id,
+          name,
+          phone,
+          timeframe,
+          people,
+          location,
+          wish,
+        });
+
+        await channel.send({ content: `<@&${MANAGER_ROLE_ID}>`, embeds: [embed], components: [bookingButtons()] });
+        return interaction.reply({ content: "✅ Deine Essensstand-Buchung wurde gesendet.", ephemeral: true });
       }
 
       // MANAGEMENT MODALS
