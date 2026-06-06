@@ -150,6 +150,11 @@ const client = new Client({
 const managementDrafts = new Map();
 const timeManagementDrafts = new Map();
 
+// Ticket-Remove Schutz: Wenn ein User aus einem Ticket entfernt wurde,
+// darf ihn die Auto-Add-Logik nicht erneut in genau diesen Thread packen.
+// Die Datenbank bleibt die Hauptquelle, diese Map schützt zusätzlich während der Laufzeit.
+const ticketRemovalBlocklist = new Map();
+
 function draftKey(userId, type) {
   return `${userId}:${type}`;
 }
@@ -936,12 +941,38 @@ async function getTicketByThread(threadId) {
   return res.rows[0] || null;
 }
 
+function getRuntimeRemovedSet(threadId) {
+  if (!ticketRemovalBlocklist.has(threadId)) ticketRemovalBlocklist.set(threadId, new Set());
+  return ticketRemovalBlocklist.get(threadId);
+}
+
 async function getRemovedTicketUserIds(threadId) {
   const res = await query(`SELECT user_id FROM ticket_removed_members WHERE thread_id = $1`, [threadId]).catch(() => ({ rows: [] }));
-  return new Set(res.rows.map((row) => row.user_id));
+  const removed = new Set(res.rows.map((row) => row.user_id));
+
+  const runtimeSet = ticketRemovalBlocklist.get(threadId);
+  if (runtimeSet) {
+    for (const userId of runtimeSet) removed.add(userId);
+  }
+
+  return removed;
+}
+
+async function isTicketUserRemoved(threadId, userId) {
+  const runtimeSet = ticketRemovalBlocklist.get(threadId);
+  if (runtimeSet?.has(userId)) return true;
+
+  const res = await query(
+    `SELECT 1 FROM ticket_removed_members WHERE thread_id = $1 AND user_id = $2 LIMIT 1`,
+    [threadId, userId]
+  ).catch(() => ({ rows: [] }));
+
+  return Boolean(res.rows[0]);
 }
 
 async function markTicketUserRemoved(threadId, userId, removedBy) {
+  getRuntimeRemovedSet(threadId).add(userId);
+
   await query(
     `
     INSERT INTO ticket_removed_members (thread_id, user_id, removed_by)
@@ -955,7 +986,41 @@ async function markTicketUserRemoved(threadId, userId, removedBy) {
 }
 
 async function unmarkTicketUserRemoved(threadId, userId) {
+  const runtimeSet = ticketRemovalBlocklist.get(threadId);
+  if (runtimeSet) runtimeSet.delete(userId);
+
   await query(`DELETE FROM ticket_removed_members WHERE thread_id = $1 AND user_id = $2`, [threadId, userId]).catch(() => null);
+}
+
+async function forceRemoveTicketMember(thread, userId, reason = "Ticket-Mitglied entfernt") {
+  const attempts = [0, 3000, 12000];
+  const results = [];
+
+  for (const delay of attempts) {
+    setTimeout(async () => {
+      const stillRemoved = await isTicketUserRemoved(thread.id, userId);
+      if (!stillRemoved) return;
+
+      try {
+        await thread.members.remove(userId, reason);
+        results.push(`✅ Remove nach ${delay}ms erfolgreich`);
+      } catch (err) {
+        results.push(`❌ Remove nach ${delay}ms fehlgeschlagen: ${err?.code || "NO_CODE"}: ${err?.message || err}`);
+      }
+
+      if (delay === attempts[attempts.length - 1]) {
+        await sendTicketDebugLog(
+          `🧹 **Ticket-Remove Debug**
+` +
+          `Thread: ${thread.name} (${thread.id})
+` +
+          `User: <@${userId}> (${userId})
+` +
+          results.join("\n")
+        );
+      }
+    }, delay);
+  }
 }
 
 async function ensureTicketThread(interaction) {
@@ -1039,6 +1104,9 @@ async function addAllowedStaffToThread(thread, categoryKey) {
 
   for (const [, member] of candidates) {
     try {
+      // Direkt vor dem Hinzufügen erneut prüfen, damit entfernte User nicht durch spätere Auto-Adds wieder reinkommen.
+      if (await isTicketUserRemoved(thread.id, member.id)) continue;
+
       await thread.members.add(member.id, "Automatischer Ticket-Teamzugriff");
       added.push(`${member.user.tag} (${member.id})`);
       await new Promise((resolve) => setTimeout(resolve, 250));
@@ -2932,11 +3000,25 @@ client.on("interactionCreate", async (interaction) => {
         if (target.id === ticket.opener_id) {
           return interaction.reply({ content: "❌ Der Ticket-Ersteller kann nicht aus seinem eigenen Ticket entfernt werden.", ephemeral: true });
         }
+        // Wichtig: Erst blockieren, dann entfernen. So kann kein späterer Auto-Add den User erneut reinholen.
         await markTicketUserRemoved(interaction.channel.id, target.id, interaction.user.id);
-        await interaction.channel.members.remove(target.id).catch((err) => {
-          console.error(`❌ Konnte ${target.tag} nicht aus dem Ticket entfernen:`, err?.message || err);
+        await forceRemoveTicketMember(interaction.channel, target.id, `Dauerhaft aus Ticket entfernt von ${interaction.user.tag}`);
+
+        await interaction.reply({
+          content:
+            `➖ <@${interaction.user.id}> hat ${target} dauerhaft aus dem Ticket entfernt. ` +
+            `Er wird nicht automatisch wieder hinzugefügt.`,
         });
-        await interaction.reply({ content: `➖ <@${interaction.user.id}> hat ${target} dauerhaft aus dem Ticket entfernt. Er wird nicht automatisch wieder hinzugefügt.` });
+
+        await sendTicketDebugLog(
+          `🧹 **Ticket-Remove gesetzt**
+` +
+          `Thread: ${interaction.channel.name} (${interaction.channel.id})
+` +
+          `Entfernt: ${target.tag} (${target.id})
+` +
+          `Von: ${interaction.user.tag} (${interaction.user.id})`
+        );
         return;
       }
 
