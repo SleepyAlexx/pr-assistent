@@ -604,18 +604,18 @@ async function registerCommands() {
 
   const rest = new REST({ version: "10" }).setToken(TOKEN);
 
-  await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), {
-    body: [],
-  });
+  try {
+    // Wichtig: Commands NICHT vorher löschen.
+    // Discord überschreibt die Guild-Commands automatisch mit dieser Liste.
+    // So verschwinden die /Commands nicht, falls beim Registrieren mal ein Fehler kommt.
+    await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), {
+      body: commands,
+    });
 
-  console.log("🧹 Alte Slash Commands gelöscht.");
-  await new Promise((resolve) => setTimeout(resolve, 3000));
-
-  await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), {
-    body: commands,
-  });
-
-  console.log("✅ Slash Commands registriert.");
+    console.log(`✅ Slash Commands registriert: ${commands.length}`);
+  } catch (err) {
+    console.error("❌ Fehler beim Registrieren der Slash Commands:", err);
+  }
 }
 
 // =====================
