@@ -3,7 +3,7 @@
 // Update: 3-Stunden-Pflicht entfernt, Bungalow- & Essensstand-Buchungen ergänzt, Status gesetzt.
 // Update: Teamupdate-Rollen korrigiert, Probe-Mitarbeiter und Casino-Mitarbeiter ergänzt, Verwarnungen aus Teamupdate entfernt.
 // Update: Ticket-System mit öffentlichen Threads, Claim-System, Add/Remove/Rename/Close/Open Commands ergänzt.
-// Update: Ticket-Threads sind privat; berechtigte Teammitglieder werden automatisch hinzugefügt + Debug-Logs im Manager-Chat.
+// Update: Private Ticket-Threads + stabilerer Member-Fetch ohne Query + Debug-Logs im Ticket-Debug-Channel.
 // Wichtig: DISCORD_TOKEN, CLIENT_ID, GUILD_ID und DATABASE_URL in der .env eintragen.
 
 if (process.env.NODE_ENV !== "production") require("dotenv").config();
@@ -950,26 +950,41 @@ async function sendTicketDebugLog(message) {
   await channel.send({ content: message.slice(0, 1900) }).catch(() => null);
 }
 
+async function fetchAllGuildMembersForTickets(guild) {
+  // Wichtig: Keine Query-Suche nutzen. Ohne Parameter lädt discord.js alle Server-Mitglieder.
+  // Dafür muss im Developer Portal der SERVER MEMBERS INTENT aktiv sein und der Bot neu deployed sein.
+  try {
+    const members = await guild.members.fetch();
+    return { members, source: "guild.members.fetch()", error: null };
+  } catch (err) {
+    console.error("❌ guild.members.fetch() ist fehlgeschlagen:", err);
+
+    // Fallback: Falls Discord nicht alle Mitglieder liefert, nutzen wir wenigstens den aktuellen Cache.
+    // Das ist nicht perfekt, aber verhindert, dass komplett 0 Leute gefunden werden.
+    return { members: guild.members.cache, source: "guild.members.cache (Fallback)", error: err };
+  }
+}
+
 async function addAllowedStaffToThread(thread, categoryKey) {
   const guild = await client.guilds.fetch(GUILD_ID);
 
-  // Der Bot selbst tritt dem Thread bei, bevor Mitglieder hinzugefügt werden.
-  // Das hilft besonders bei privaten Threads.
   await thread.join().catch((err) => {
     console.error("⚠️ Bot konnte dem Ticket-Thread nicht beitreten:", err?.message || err);
   });
 
   const allowedRoles = TICKET_AUTO_ADD_ROLE_IDS;
+  const fetchResult = await fetchAllGuildMembersForTickets(guild);
+  const members = fetchResult.members;
 
-  const members = await guild.members.fetch({ force: true, cache: true }).catch((err) => {
-    console.error("❌ Mitglieder konnten für Ticket-Zugriff nicht geladen werden:", err);
-    return null;
-  });
-
-  if (!members) {
+  if (!members || members.size === 0) {
     await sendTicketDebugLog(
       `❌ **Ticket-Debug** (${categoryKey})\n` +
-      `Mitglieder konnten nicht geladen werden. Prüfe im Developer Portal den **SERVER MEMBERS INTENT** und die Bot-Rechte.`
+      `Es konnten keine Mitglieder geladen werden.\n\n` +
+      `Quelle: **${fetchResult.source}**\n` +
+      (fetchResult.error
+        ? `Fehler: \`${fetchResult.error?.code || "NO_CODE"}: ${String(fetchResult.error?.message || fetchResult.error).slice(0, 900)}\``
+        : `Kein genauer Fehler vorhanden.`) +
+      `\n\nBitte prüfen: SERVER MEMBERS INTENT aktiv, Bot neu deployed, Bot-Rolle hoch genug.`
     );
     return { added: 0, failed: 0, found: 0 };
   }
@@ -981,7 +996,7 @@ async function addAllowedStaffToThread(thread, categoryKey) {
   });
 
   const candidates = members.filter((member) => {
-    if (member.user.bot) return false;
+    if (!member || member.user?.bot) return false;
     return memberHasAnyRole(member, allowedRoles);
   });
 
@@ -992,6 +1007,7 @@ async function addAllowedStaffToThread(thread, categoryKey) {
     try {
       await thread.members.add(member.id, "Automatischer Ticket-Teamzugriff");
       added.push(`${member.user.tag} (${member.id})`);
+      await new Promise((resolve) => setTimeout(resolve, 250));
     } catch (err) {
       failed.push(`${member.user.tag} (${member.id}) → ${err?.code || "NO_CODE"}: ${err?.message || err}`);
       console.error(`❌ Konnte ${member.user.tag} (${member.id}) nicht zum Ticket-Thread hinzufügen:`, err);
@@ -1001,10 +1017,14 @@ async function addAllowedStaffToThread(thread, categoryKey) {
   const debugText =
     `🎫 **Ticket-Debug** (${categoryKey})\n` +
     `Thread: ${thread.name} (${thread.id})\n` +
+    `Member-Quelle: **${fetchResult.source}**\n` +
+    (fetchResult.error ? `Fetch-Fehler/Fallback: \`${fetchResult.error?.code || "NO_CODE"}: ${String(fetchResult.error?.message || fetchResult.error).slice(0, 600)}\`\n` : "") +
+    `Geladene Server-Mitglieder: **${members.size}**\n` +
     `Gefundene Teammitglieder: **${candidates.size}**\n` +
     `Erfolgreich hinzugefügt: **${added.length}**\n` +
     `Fehlgeschlagen: **${failed.length}**\n\n` +
     `**Rollen-Check:**\n${roleCounts.slice(0, 20).join("\n")}\n\n` +
+    (added.length ? `**Hinzugefügt:**\n${added.slice(0, 12).join("\n")}\n\n` : "") +
     (failed.length
       ? `**Fehler:**\n${failed.slice(0, 10).join("\n")}`
       : `✅ Keine Fehler beim Hinzufügen.`);
