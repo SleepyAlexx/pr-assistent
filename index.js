@@ -2,8 +2,8 @@
 // Grundlage: aktuelles CaffeeContainer-Script, angepasst auf den neuen Pearls-Discord.
 // Update: 3-Stunden-Pflicht entfernt, Bungalow- & Essensstand-Buchungen ergänzt, Status gesetzt.
 // Update: Teamupdate-Rollen korrigiert, Probe-Mitarbeiter und Casino-Mitarbeiter ergänzt, Verwarnungen aus Teamupdate entfernt.
-// Update: Ticket-System mit privaten Threads, Claim-System, Add/Remove/Rename/Close/Open Commands ergänzt.
-// Update: Teammitglieder mit berechtigten Rollen werden automatisch in private Ticket-Threads eingeladen + @everyone Ping.
+// Update: Ticket-System mit öffentlichen Threads, Claim-System, Add/Remove/Rename/Close/Open Commands ergänzt.
+// Update: Ticket-Threads sind öffentlich im jeweiligen Ticket-Channel; Zugriff läuft über Channel-Rechte + @everyone Ping.
 // Wichtig: DISCORD_TOKEN, CLIENT_ID, GUILD_ID und DATABASE_URL in der .env eintragen.
 
 if (process.env.NODE_ENV !== "production") require("dotenv").config();
@@ -973,8 +973,7 @@ async function createTicketFromButton(interaction, categoryKey) {
   const thread = await parentChannel.threads.create({
     name: baseName,
     autoArchiveDuration: 1440,
-    type: ChannelType.PrivateThread,
-    invitable: false,
+    type: ChannelType.PublicThread,
     reason: `Ticket erstellt von ${interaction.user.tag}`,
   });
 
