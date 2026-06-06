@@ -608,22 +608,48 @@ async function registerCommands() {
       .setDescription("Sendet das Zeitverwaltungs-Panel."),
   ].map((cmd) => cmd.toJSON());
 
-  const rest = new REST({ version: "10", timeout: 120000 }).setToken(TOKEN);
-
-  try {
-    // Wichtig: Commands NICHT vorher löschen.
-    // Discord überschreibt die Guild-Commands automatisch mit dieser Liste.
-    // Kein 20-Sekunden-Abbruch mehr: Railway/Discord kann manchmal länger brauchen.
-    console.log(`🔄 Slash Commands werden registriert: ${commands.length} Commands für Guild ${GUILD_ID}...`);
-
-    await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), {
-      body: commands,
+  async function withTimeout(promise, ms, label) {
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} hat nach ${Math.round(ms / 1000)} Sekunden nicht geantwortet.`)), ms);
     });
 
-    console.log(`✅ Slash Commands registriert: ${commands.length}`);
+    try {
+      return await Promise.race([promise, timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // Wir registrieren die Commands zuerst über den bereits verbundenen Guild-Client.
+  // Das ist auf Railway oft stabiler als der direkte REST-Aufruf beim Start.
+  try {
+    console.log(`🔄 Slash Commands werden registriert über Guild-Client: ${commands.length} Commands für Guild ${GUILD_ID}...`);
+
+    const guild = await withTimeout(client.guilds.fetch(GUILD_ID), 30000, "Guild-Fetch");
+    await withTimeout(guild.commands.set(commands), 90000, "Guild-Command-Registrierung");
+
+    console.log(`✅ Slash Commands registriert über Guild-Client: ${commands.length}`);
     return true;
-  } catch (err) {
-    console.error("❌ Fehler beim Registrieren der Slash Commands:", err);
+  } catch (guildErr) {
+    console.error("⚠️ Guild-Client Registrierung fehlgeschlagen. Versuche REST-Fallback...", guildErr);
+  }
+
+  // Fallback: direkter REST-Bulk-Overwrite. Alte Commands werden NICHT vorher gelöscht.
+  try {
+    console.log(`🔄 Slash Commands werden registriert über REST-Fallback: ${commands.length} Commands für Guild ${GUILD_ID}...`);
+
+    const rest = new REST({ version: "10", timeout: 120000 }).setToken(TOKEN);
+    await withTimeout(
+      rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands }),
+      120000,
+      "REST-Command-Registrierung"
+    );
+
+    console.log(`✅ Slash Commands registriert über REST-Fallback: ${commands.length}`);
+    return true;
+  } catch (restErr) {
+    console.error("❌ Fehler beim Registrieren der Slash Commands über beide Wege:", restErr);
     console.error("⚠️ Der Bot bleibt online, aber die Slash Commands wurden nicht aktualisiert.");
     return false;
   }
