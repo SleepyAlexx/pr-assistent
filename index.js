@@ -4,6 +4,7 @@
 // Update: Teamupdate-Rollen korrigiert, Probe-Mitarbeiter und Casino-Mitarbeiter ergänzt, Verwarnungen aus Teamupdate entfernt.
 // Update: Ticket-System mit öffentlichen Threads, Claim-System, Add/Remove/Rename/Close/Open Commands ergänzt.
 // Update: Private Ticket-Threads + stabilerer Member-Fetch ohne Query + Debug-Logs im Ticket-Debug-Channel.
+// Update: ticket-rename gefixt, Bürgerrollen für Slash-Commands gesperrt und nicht automatisch in Tickets eingeladen.
 // Wichtig: DISCORD_TOKEN, CLIENT_ID, GUILD_ID und DATABASE_URL in der .env eintragen.
 
 if (process.env.NODE_ENV !== "production") require("dotenv").config();
@@ -121,6 +122,13 @@ const TERMINATION_REMOVE_ROLE_IDS = [
 const REGISTRATION_ROLE_IDS = [
   "1512314173844095170",
   "1512314173844095169",
+  "1512314173844095175",
+];
+
+// Bürgerrollen: dürfen keine Slash-Commands nutzen, solange sie keine Team-/Leitungsrolle haben.
+// Sie werden außerdem nicht automatisch in Ticket-Threads eingeladen.
+const CITIZEN_COMMAND_BLOCK_ROLE_IDS = [
+  "1512314173844095170",
   "1512314173844095175",
 ];
 
@@ -930,6 +938,17 @@ function categoryRoles(categoryKey) {
 function memberHasAnyRole(member, roleIds) {
   if (!member?.roles?.cache) return false;
   return roleIds.some((roleId) => member.roles.cache.has(roleId));
+}
+
+function isRestrictedCitizenCommandUser(member) {
+  if (!member?.roles?.cache) return false;
+
+  const hasCitizenRole = memberHasAnyRole(member, CITIZEN_COMMAND_BLOCK_ROLE_IDS);
+  if (!hasCitizenRole) return false;
+
+  // Sobald jemand eine Team-/Leitungsrolle hat, darf er Commands nutzen, auch wenn er noch Bürgerrollen besitzt.
+  const hasTeamOrLeadershipRole = memberHasAnyRole(member, TICKET_AUTO_ADD_ROLE_IDS);
+  return !hasTeamOrLeadershipRole;
 }
 
 function canUseTicketStaffCommands(member, categoryKey) {
@@ -2825,6 +2844,13 @@ client.on("interactionCreate", async (interaction) => {
     // SLASH COMMANDS
     // =====================
     if (interaction.isChatInputCommand()) {
+      if (isRestrictedCitizenCommandUser(interaction.member)) {
+        return interaction.reply({
+          content: "❌ Bürger können keine Bot-Commands benutzen.",
+          ephemeral: true,
+        });
+      }
+
       if (interaction.commandName === "uhr") {
         if (!canCreatePanels(interaction.member)) {
           return interaction.reply({ content: "❌ Du darfst dieses Panel nicht erstellen.", ephemeral: true });
@@ -3028,11 +3054,27 @@ client.on("interactionCreate", async (interaction) => {
         if (!canUseTicketStaffCommands(interaction.member, ticket.category)) {
           return interaction.reply({ content: "❌ Du darfst dieses Ticket nicht umbenennen.", ephemeral: true });
         }
+
         const rawName = interaction.options.getString("name");
         const newName = cleanTicketName(rawName).slice(0, 95);
-        await interaction.channel.setName(newName).catch(() => null);
-        await query(`UPDATE ticket_records SET current_name = $2, updated_at = NOW() WHERE thread_id = $1`, [interaction.channel.id, newName]);
-        await interaction.reply({ content: `✏️ <@${interaction.user.id}> hat das Ticket zu \`${newName}\` umbenannt.` });
+
+        await interaction.deferReply();
+
+        try {
+          await interaction.channel.setName(newName, `Ticket umbenannt von ${interaction.user.tag}`);
+        } catch (err) {
+          console.error("❌ Ticket konnte nicht umbenannt werden:", err);
+          return interaction.editReply({
+            content: `❌ Das Ticket konnte nicht umbenannt werden. Bitte prüfe die Bot-Rechte. Fehler: \`${err?.code || "NO_CODE"}\``,
+          });
+        }
+
+        await query(
+          `UPDATE ticket_records SET current_name = $2, updated_at = NOW() WHERE thread_id = $1`,
+          [interaction.channel.id, newName]
+        );
+
+        await interaction.editReply({ content: `✏️ <@${interaction.user.id}> hat das Ticket zu \`${newName}\` umbenannt.` });
         return;
       }
 
