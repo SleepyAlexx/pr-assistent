@@ -2,6 +2,7 @@
 // Grundlage: aktuelles CaffeeContainer-Script, angepasst auf den neuen Pearls-Discord.
 // Update: 3-Stunden-Pflicht entfernt, Bungalow- & Essensstand-Buchungen ergänzt, Status gesetzt.
 // Update: Teamupdate-Rollen korrigiert, Probe-Mitarbeiter und Casino-Mitarbeiter ergänzt, Verwarnungen aus Teamupdate entfernt.
+// Update: Ticket-System mit privaten Threads, Claim-System, Add/Remove/Rename/Close/Open Commands ergänzt.
 // Wichtig: DISCORD_TOKEN, CLIENT_ID, GUILD_ID und DATABASE_URL in der .env eintragen.
 
 if (process.env.NODE_ENV !== "production") require("dotenv").config();
@@ -21,6 +22,7 @@ const {
   SlashCommandBuilder,
   UserSelectMenuBuilder,
   StringSelectMenuBuilder,
+  ChannelType,
 } = require("discord.js");
 
 const { Pool } = require("pg");
@@ -95,6 +97,18 @@ const MANAGER_CHAT_CHANNEL_ID = "1512314181259366547";
 
 const BOOKING_REQUEST_CHANNEL_ID = "1512409329771221075";
 const BOOKING_CONFIRMED_CHANNEL_ID = "1512409661029224488";
+
+// =====================
+// TICKET-SYSTEM
+// =====================
+// Wichtig: Für Event und Allgemein bitte später die richtigen Channel-IDs eintragen,
+// falls dafür eigene Bereiche erstellt werden. Aktuell laufen sie als Fallback in den Buchungen-Channel.
+const TICKET_BUNGALOW_CHANNEL_ID = "1512762754732261386";
+const TICKET_ESSENSSTAND_CHANNEL_ID = "1512762825603285193";
+const TICKET_EVENT_CHANNEL_ID = "1512762866917441617";
+const TICKET_GENERAL_CHANNEL_ID = "1512762899024842803";
+
+const TICKET_CLOSE_AFTER_MS = 2 * 24 * 60 * 60 * 1000;
 
 const TERMINATION_REMOVE_ROLE_IDS = [
   EMPLOYEE_ROLE_ID,
@@ -416,6 +430,25 @@ async function initDatabase() {
     );
   `);
 
+  await query(`
+    CREATE TABLE IF NOT EXISTS ticket_records (
+      id SERIAL PRIMARY KEY,
+      thread_id TEXT UNIQUE NOT NULL,
+      opener_id TEXT NOT NULL,
+      category TEXT NOT NULL,
+      claimed_by TEXT,
+      status TEXT NOT NULL DEFAULT 'open',
+      base_name TEXT NOT NULL,
+      current_name TEXT NOT NULL,
+      close_requested_by TEXT,
+      close_requested_at TIMESTAMPTZ,
+      close_deadline_at TIMESTAMPTZ,
+      close_message_id TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
   // Keine alten Fivebot-Zeiten mehr importieren.
   // Bestehende Zeiten bleiben in der Datenbank erhalten.
 
@@ -444,8 +477,50 @@ async function registerCommands() {
       .setDescription("Sendet das Registrierungs-Panel."),
 
     new SlashCommandBuilder()
-      .setName("buchungspanel")
-      .setDescription("Sendet das Bungalow- und Essensstand-Buchungspanel."),
+      .setName("ticketpanel")
+      .setDescription("Sendet das Pearls Ticket-Panel."),
+
+    new SlashCommandBuilder()
+      .setName("ticket-add")
+      .setDescription("Fügt einen User zum aktuellen Ticket hinzu.")
+      .addUserOption((option) =>
+        option
+          .setName("user")
+          .setDescription("User auswählen")
+          .setRequired(true)
+      ),
+
+    new SlashCommandBuilder()
+      .setName("ticket-remove")
+      .setDescription("Entfernt einen User aus dem aktuellen Ticket.")
+      .addUserOption((option) =>
+        option
+          .setName("user")
+          .setDescription("User auswählen")
+          .setRequired(true)
+      ),
+
+    new SlashCommandBuilder()
+      .setName("ticket-rename")
+      .setDescription("Benennt das aktuelle Ticket um.")
+      .addStringOption((option) =>
+        option
+          .setName("name")
+          .setDescription("Neuer Ticketname")
+          .setRequired(true)
+      ),
+
+    new SlashCommandBuilder()
+      .setName("ticket-claim")
+      .setDescription("Übernimmt das aktuelle Ticket."),
+
+    new SlashCommandBuilder()
+      .setName("ticket-close")
+      .setDescription("Startet eine Schließungsanfrage für das aktuelle Ticket."),
+
+    new SlashCommandBuilder()
+      .setName("ticket-open")
+      .setDescription("Öffnet ein archiviertes/geschlossenes Ticket wieder."),
 
     new SlashCommandBuilder()
       .setName("dashboard")
@@ -705,6 +780,377 @@ function buildBookingEmbed(data) {
     .setFooter({ text: isFoodstand ? "Pearls • Essensstand-Buchungssystem" : "Pearls • Bungalow-Buchungssystem" })
     .setTimestamp();
 }
+
+// =====================
+// TICKET-SYSTEM HELPERS
+// =====================
+const TICKET_CATEGORIES = {
+  bungalow: {
+    label: "Bungalow buchen",
+    short: "bungalow",
+    emoji: "🏝️",
+    channelId: TICKET_BUNGALOW_CHANNEL_ID,
+    access: "staff",
+    description:
+      "Für Bungalow-Anfragen, Reservierungen, Aufenthalte oder private Buchungen.",
+  },
+  essensstand: {
+    label: "Essensstand buchen",
+    short: "essensstand",
+    emoji: "🍽️",
+    channelId: TICKET_ESSENSSTAND_CHANNEL_ID,
+    access: "management",
+    description:
+      "Für Essensstand-Anfragen bei Events, Feiern oder besonderen Veranstaltungen.",
+  },
+  event: {
+    label: "Event-Anfrage",
+    short: "event",
+    emoji: "🎉",
+    channelId: TICKET_EVENT_CHANNEL_ID,
+    access: "management",
+    description:
+      "Für größere Veranstaltungen, Kooperationen oder geplante Events.",
+  },
+  allgemein: {
+    label: "Allgemeine Anfrage",
+    short: "allgemein",
+    emoji: "❓",
+    channelId: TICKET_GENERAL_CHANNEL_ID,
+    access: "staff",
+    description:
+      "Für Fragen, Support oder sonstige Anliegen.",
+  },
+};
+
+const TICKET_STAFF_ROLE_IDS = [
+  PROBE_ROLE_ID,
+  EMPLOYEE_ROLE_ID,
+  TEAMUPDATE_PROBE_EMPLOYEE_ROLE_ID,
+  TEAMUPDATE_EMPLOYEE_ROLE_ID,
+  TEAMUPDATE_EMPLOYEE_BASE_ROLE_ID,
+  TEAMUPDATE_PROBE_MANAGER_ROLE_ID,
+  TEAMUPDATE_MANAGER_ROLE_ID,
+  TEAMUPDATE_PERSONAL_MANAGER_ROLE_ID,
+  TEAMUPDATE_MANAGEMENT_BASE_ROLE_ID,
+  OWNER_ROLE_ID,
+  CO_OWNER_ROLE_ID,
+  HIGH_COMMAND_ROLE_ID,
+];
+
+const TICKET_MANAGEMENT_ROLE_IDS = [
+  TEAMUPDATE_PROBE_MANAGER_ROLE_ID,
+  TEAMUPDATE_MANAGER_ROLE_ID,
+  TEAMUPDATE_PERSONAL_MANAGER_ROLE_ID,
+  TEAMUPDATE_MANAGEMENT_BASE_ROLE_ID,
+  OWNER_ROLE_ID,
+  CO_OWNER_ROLE_ID,
+  HIGH_COMMAND_ROLE_ID,
+];
+
+function ticketPanelButtons() {
+  const row1 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("ticket_open_bungalow").setLabel("Bungalow buchen").setEmoji("🏝️").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("ticket_open_essensstand").setLabel("Essensstand buchen").setEmoji("🍽️").setStyle(ButtonStyle.Success)
+  );
+
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("ticket_open_event").setLabel("Event-Anfrage").setEmoji("🎉").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("ticket_open_allgemein").setLabel("Allgemeine Anfrage").setEmoji("❓").setStyle(ButtonStyle.Secondary)
+  );
+
+  return [row1, row2];
+}
+
+function ticketThreadButtons() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("ticket_claim").setLabel("Ticket übernehmen").setEmoji("📌").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("ticket_request_close").setLabel("Ticket schließen").setEmoji("🔒").setStyle(ButtonStyle.Danger)
+  );
+}
+
+function ticketCloseButtons(ticketId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`ticket_close_confirm_${ticketId}`).setLabel("Schließen").setEmoji("✅").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(`ticket_close_cancel_${ticketId}`).setLabel("Abbrechen").setEmoji("❌").setStyle(ButtonStyle.Secondary)
+  );
+}
+
+function cleanTicketName(name) {
+  return (name || "user")
+    .toLowerCase()
+    .replace(/ä/g, "ae")
+    .replace(/ö/g, "oe")
+    .replace(/ü/g, "ue")
+    .replace(/ß/g, "ss")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 18) || "user";
+}
+
+function memberTicketName(member, user) {
+  return cleanTicketName(member?.nickname || user?.globalName || user?.username || "user");
+}
+
+function categoryRoles(categoryKey) {
+  const category = TICKET_CATEGORIES[categoryKey];
+  return category?.access === "management" ? TICKET_MANAGEMENT_ROLE_IDS : TICKET_STAFF_ROLE_IDS;
+}
+
+function memberHasAnyRole(member, roleIds) {
+  if (!member?.roles?.cache) return false;
+  return roleIds.some((roleId) => member.roles.cache.has(roleId));
+}
+
+function canUseTicketStaffCommands(member, categoryKey) {
+  return memberHasAnyRole(member, categoryRoles(categoryKey));
+}
+
+async function getTicketByThread(threadId) {
+  const res = await query(`SELECT * FROM ticket_records WHERE thread_id = $1`, [threadId]);
+  return res.rows[0] || null;
+}
+
+async function ensureTicketThread(interaction) {
+  if (!interaction.channel?.isThread?.()) {
+    await interaction.reply({ content: "❌ Dieser Command kann nur in einem Ticket-Thread genutzt werden.", ephemeral: true });
+    return null;
+  }
+
+  const ticket = await getTicketByThread(interaction.channel.id);
+  if (!ticket) {
+    await interaction.reply({ content: "❌ Dieser Thread ist kein bekanntes Ticket.", ephemeral: true });
+    return null;
+  }
+
+  return ticket;
+}
+
+async function addAllowedStaffToThread(thread, categoryKey) {
+  const guild = await client.guilds.fetch(GUILD_ID);
+  const members = await guild.members.fetch().catch(() => null);
+  if (!members) return;
+
+  const allowedRoles = categoryRoles(categoryKey);
+  const added = new Set();
+
+  for (const [, member] of members) {
+    if (member.user.bot) continue;
+    if (added.has(member.id)) continue;
+    if (!memberHasAnyRole(member, allowedRoles)) continue;
+
+    added.add(member.id);
+    await thread.members.add(member.id).catch(() => null);
+  }
+}
+
+async function createTicketFromButton(interaction, categoryKey) {
+  const category = TICKET_CATEGORIES[categoryKey];
+  if (!category) return interaction.reply({ content: "❌ Diese Ticket-Kategorie existiert nicht.", ephemeral: true });
+
+  const parentChannel = await client.channels.fetch(category.channelId).catch(() => null);
+  if (!parentChannel || !parentChannel.threads) {
+    return interaction.reply({ content: "❌ Der Ticket-Channel wurde nicht gefunden oder ist kein Textchannel.", ephemeral: true });
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+
+  const baseName = `${category.emoji}-${category.short}-anfrage`;
+  const thread = await parentChannel.threads.create({
+    name: baseName,
+    autoArchiveDuration: 1440,
+    type: ChannelType.PrivateThread,
+    invitable: false,
+    reason: `Ticket erstellt von ${interaction.user.tag}`,
+  });
+
+  await thread.members.add(interaction.user.id).catch(() => null);
+  await addAllowedStaffToThread(thread, categoryKey);
+
+  const insert = await query(
+    `
+    INSERT INTO ticket_records (thread_id, opener_id, category, base_name, current_name)
+    VALUES ($1, $2, $3, $4, $5)
+    RETURNING id;
+    `,
+    [thread.id, interaction.user.id, categoryKey, baseName, baseName]
+  );
+
+  const ticketId = insert.rows[0].id;
+
+  const embed = new EmbedBuilder()
+    .setColor(0x5dade2)
+    .setTitle(`${category.emoji} ・${category.label.toUpperCase()}`)
+    .setDescription(
+      `Willkommen <@${interaction.user.id}>.\n\n` +
+        `${category.description}\n\n` +
+        "Bitte beschreibe dein Anliegen so genau wie möglich. Ein Teammitglied wird sich darum kümmern.\n\n" +
+        "━━━━━━━━━━━━━━━━━━━━\n" +
+        `🎫 Ticket-ID: **#${ticketId}**\n` +
+        `👤 Erstellt von: <@${interaction.user.id}>\n` +
+        `📌 Status: **Offen**\n` +
+        "━━━━━━━━━━━━━━━━━━━━"
+    )
+    .setFooter({ text: "Pearls • Ticket-System" })
+    .setTimestamp();
+
+  await thread.send({
+    content: `<@${interaction.user.id}>`,
+    embeds: [embed],
+    components: [ticketThreadButtons()],
+  });
+
+  await interaction.editReply({ content: `✅ Dein Ticket wurde erstellt: ${thread}` });
+}
+
+async function claimTicket(interaction) {
+  const ticket = await ensureTicketThread(interaction);
+  if (!ticket) return;
+
+  if (!canUseTicketStaffCommands(interaction.member, ticket.category)) {
+    return interaction.reply({ content: "❌ Du darfst dieses Ticket nicht übernehmen.", ephemeral: true });
+  }
+
+  const category = TICKET_CATEGORIES[ticket.category];
+  const handlerName = memberTicketName(interaction.member, interaction.user);
+  const newName = `${handlerName}-${category.emoji}-${category.short}`.slice(0, 95);
+
+  await interaction.channel.setName(newName).catch(() => null);
+  await query(
+    `
+    UPDATE ticket_records
+    SET claimed_by = $2,
+        current_name = $3,
+        status = 'open',
+        updated_at = NOW()
+    WHERE thread_id = $1;
+    `,
+    [interaction.channel.id, interaction.user.id, newName]
+  );
+
+  const embed = new EmbedBuilder()
+    .setColor(0x2ecc71)
+    .setTitle("📌 ・TICKET ÜBERNOMMEN")
+    .setDescription(`<@${interaction.user.id}> hat dieses Ticket übernommen.`)
+    .setTimestamp();
+
+  await interaction.reply({ embeds: [embed] });
+}
+
+async function requestTicketClose(interaction) {
+  const ticket = await ensureTicketThread(interaction);
+  if (!ticket) return;
+
+  if (!canUseTicketStaffCommands(interaction.member, ticket.category)) {
+    return interaction.reply({ content: "❌ Du darfst dieses Ticket nicht schließen.", ephemeral: true });
+  }
+
+  const deadline = new Date(Date.now() + TICKET_CLOSE_AFTER_MS);
+  const closingName = `closing-${ticket.current_name || ticket.base_name}`.slice(0, 95);
+
+  await interaction.channel.setName(closingName).catch(() => null);
+
+  const embed = new EmbedBuilder()
+    .setColor(0xe67e22)
+    .setTitle("🔒 ・SCHLIESSUNGSANFRAGE")
+    .setDescription(
+      `<@${interaction.user.id}> möchte dieses Ticket schließen.\n\n` +
+        `Du hast nun **2 Tage Zeit**, die Schließung zu bestätigen oder abzulehnen.\n\n` +
+        "━━━━━━━━━━━━━━━━━━━━\n" +
+        "⏳ Frist: läuft in **2 Tagen** ab"
+    )
+    .setFooter({ text: "Pearls • Ticket-Schließung" })
+    .setTimestamp();
+
+  const msg = await interaction.channel.send({
+    content: `<@${ticket.opener_id}>`,
+    embeds: [embed],
+    components: [ticketCloseButtons(ticket.id)],
+  });
+
+  await query(
+    `
+    UPDATE ticket_records
+    SET status = 'closing_requested',
+        close_requested_by = $2,
+        close_requested_at = NOW(),
+        close_deadline_at = $3,
+        close_message_id = $4,
+        updated_at = NOW()
+    WHERE id = $1;
+    `,
+    [ticket.id, interaction.user.id, deadline, msg.id]
+  );
+
+  return interaction.reply({ content: "✅ Schließungsanfrage wurde gestellt.", ephemeral: true });
+}
+
+async function handleTicketCloseDecision(interaction, ticketId, decision) {
+  const res = await query(`SELECT * FROM ticket_records WHERE id = $1`, [ticketId]);
+  const ticket = res.rows[0];
+  if (!ticket) return interaction.reply({ content: "❌ Ticket wurde nicht gefunden.", ephemeral: true });
+
+  if (interaction.user.id !== ticket.opener_id) {
+    return interaction.reply({ content: "❌ Nur der Ticket-Ersteller darf diese Schließung bestätigen oder abbrechen.", ephemeral: true });
+  }
+
+  const thread = interaction.channel;
+
+  if (decision === "confirm") {
+    await interaction.reply({ content: "✅ Ticket wird geschlossen und gelöscht.", ephemeral: true });
+    await query(`UPDATE ticket_records SET status = 'closed', updated_at = NOW() WHERE id = $1`, [ticket.id]);
+    await thread.send({ content: `✅ ・TICKET GESCHLOSSEN\n\n<@${interaction.user.id}> hat die Schließung bestätigt. Der Thread wird nun gelöscht.` }).catch(() => null);
+    setTimeout(() => thread.delete("Ticket-Schließung bestätigt").catch(() => null), 2500);
+    return;
+  }
+
+  const restoreName = ticket.current_name || ticket.base_name;
+  await thread.setName(restoreName).catch(() => null);
+  await query(
+    `
+    UPDATE ticket_records
+    SET status = 'open',
+        close_requested_by = NULL,
+        close_requested_at = NULL,
+        close_deadline_at = NULL,
+        close_message_id = NULL,
+        updated_at = NOW()
+    WHERE id = $1;
+    `,
+    [ticket.id]
+  );
+
+  const ping = ticket.claimed_by ? `<@${ticket.claimed_by}>` : ticket.close_requested_by ? `<@${ticket.close_requested_by}>` : "";
+  await interaction.update({ components: [] }).catch(() => null);
+  await thread.send({
+    content:
+      `❌ ・SCHLIESSUNG ABGEBROCHEN\n\n` +
+      `<@${interaction.user.id}> hat die Schließungsanfrage abgelehnt.\n\n` +
+      `Das Ticket bleibt geöffnet. ${ping ? `${ping} wurde benachrichtigt.` : ""}`,
+  });
+}
+
+async function checkTicketCloseDeadlines() {
+  const res = await query(
+    `
+    SELECT *
+    FROM ticket_records
+    WHERE status = 'closing_requested'
+      AND close_deadline_at IS NOT NULL
+      AND close_deadline_at <= NOW();
+    `
+  ).catch(() => ({ rows: [] }));
+
+  for (const ticket of res.rows) {
+    const channel = await client.channels.fetch(ticket.thread_id).catch(() => null);
+    await query(`UPDATE ticket_records SET status = 'closed', updated_at = NOW() WHERE id = $1`, [ticket.id]).catch(() => null);
+    if (channel) {
+      await channel.send({ content: "🔒 ・TICKET AUTOMATISCH GESCHLOSSEN\n\nDie Schließungsanfrage wurde nicht innerhalb von 2 Tagen beantwortet. Der Thread wird nun gelöscht." }).catch(() => null);
+      setTimeout(() => channel.delete("Ticket-Frist abgelaufen").catch(() => null), 2500);
+    }
+  }
+}
+
 
 // =====================
 // MANAGEMENT SEND
@@ -2101,6 +2547,7 @@ client.once("clientReady", async () => {
     setInterval(updateManagementTasksMessage, 5 * 60 * 1000);
     setInterval(sendStockCheckReminderIfNeeded, 60 * 1000);
     setInterval(weeklyResetOnly, 60 * 1000);
+    setInterval(checkTicketCloseDeadlines, 60 * 1000);
     setInterval(checkWarningReviewReminders, 60 * 60 * 1000);
 
     console.log("✅ Stempel-Uhr System gestartet.");
@@ -2300,29 +2747,95 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.reply({ embeds: [embed], components: [row] });
       }
 
-      if (interaction.commandName === "buchungspanel") {
+      if (interaction.commandName === "ticketpanel") {
         if (!canCreatePanels(interaction.member)) {
           return interaction.reply({ content: "❌ Du darfst dieses Panel nicht erstellen.", ephemeral: true });
         }
 
         const embed = new EmbedBuilder()
           .setColor(0x5dade2)
-          .setTitle("🏝️🍽️ ・BUCHUNGSPANEL")
+          .setTitle("🎫 ・PEARLS TICKET-SYSTEM")
           .setDescription(
             "━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-              "Hier können Gäste beim Pearls eine Buchung anfragen.\n\n" +
+              "Wähle dein Anliegen aus und eröffne ein privates Ticket.\n\n" +
               "🏝️ **Bungalow buchen**\n" +
-              "└ Für Aufenthalte, Reservierungen oder private Buchungen.\n\n" +
+              "└ Für Reservierungen, Aufenthalte oder private Buchungen.\n\n" +
               "🍽️ **Essensstand buchen**\n" +
               "└ Für Events, Feiern oder besondere Veranstaltungen.\n\n" +
-              "📌 **Bitte im passenden Formular alles ausfüllen.**\n" +
-              "✅ Nach dem Absenden prüft die Leitung die Anfrage.\n" +
+              "🎉 **Event-Anfrage**\n" +
+              "└ Für größere Veranstaltungen oder Kooperationen.\n\n" +
+              "❓ **Allgemeine Anfrage**\n" +
+              "└ Für Fragen, Support oder sonstige Anliegen.\n" +
               "━━━━━━━━━━━━━━━━━━━━━━━━"
           )
-          .setFooter({ text: "Pearls • Buchungssystem" })
+          .setFooter({ text: "Pearls • Ticket-System" })
           .setTimestamp();
 
-        return interaction.reply({ embeds: [embed], components: [bookingPanelButton()] });
+        return interaction.reply({ embeds: [embed], components: ticketPanelButtons() });
+      }
+
+      if (interaction.commandName === "ticket-add") {
+        const ticket = await ensureTicketThread(interaction);
+        if (!ticket) return;
+        if (!canUseTicketStaffCommands(interaction.member, ticket.category)) {
+          return interaction.reply({ content: "❌ Du darfst dieses Ticket nicht verwalten.", ephemeral: true });
+        }
+        const target = interaction.options.getUser("user");
+        await interaction.channel.members.add(target.id).catch(() => null);
+        await interaction.reply({ content: `➕ <@${interaction.user.id}> hat ${target} zum Ticket hinzugefügt.` });
+        return;
+      }
+
+      if (interaction.commandName === "ticket-remove") {
+        const ticket = await ensureTicketThread(interaction);
+        if (!ticket) return;
+        if (!canUseTicketStaffCommands(interaction.member, ticket.category)) {
+          return interaction.reply({ content: "❌ Du darfst dieses Ticket nicht verwalten.", ephemeral: true });
+        }
+        const target = interaction.options.getUser("user");
+        if (target.id === ticket.opener_id) {
+          return interaction.reply({ content: "❌ Der Ticket-Ersteller kann nicht aus seinem eigenen Ticket entfernt werden.", ephemeral: true });
+        }
+        await interaction.channel.members.remove(target.id).catch(() => null);
+        await interaction.reply({ content: `➖ <@${interaction.user.id}> hat ${target} aus dem Ticket entfernt.` });
+        return;
+      }
+
+      if (interaction.commandName === "ticket-rename") {
+        const ticket = await ensureTicketThread(interaction);
+        if (!ticket) return;
+        if (!canUseTicketStaffCommands(interaction.member, ticket.category)) {
+          return interaction.reply({ content: "❌ Du darfst dieses Ticket nicht umbenennen.", ephemeral: true });
+        }
+        const rawName = interaction.options.getString("name");
+        const newName = cleanTicketName(rawName).slice(0, 95);
+        await interaction.channel.setName(newName).catch(() => null);
+        await query(`UPDATE ticket_records SET current_name = $2, updated_at = NOW() WHERE thread_id = $1`, [interaction.channel.id, newName]);
+        await interaction.reply({ content: `✏️ <@${interaction.user.id}> hat das Ticket zu \`${newName}\` umbenannt.` });
+        return;
+      }
+
+      if (interaction.commandName === "ticket-claim") {
+        return claimTicket(interaction);
+      }
+
+      if (interaction.commandName === "ticket-close") {
+        return requestTicketClose(interaction);
+      }
+
+      if (interaction.commandName === "ticket-open") {
+        const ticket = await ensureTicketThread(interaction);
+        if (!ticket) return;
+        if (!canUseTicketStaffCommands(interaction.member, ticket.category)) {
+          return interaction.reply({ content: "❌ Du darfst dieses Ticket nicht wieder öffnen.", ephemeral: true });
+        }
+        const restoreName = ticket.current_name || ticket.base_name;
+        await interaction.channel.setLocked(false).catch(() => null);
+        await interaction.channel.setArchived(false).catch(() => null);
+        await interaction.channel.setName(restoreName).catch(() => null);
+        await query(`UPDATE ticket_records SET status = 'open', updated_at = NOW() WHERE thread_id = $1`, [interaction.channel.id]);
+        await interaction.reply({ content: `🔓 <@${interaction.user.id}> hat das Ticket wieder geöffnet.` });
+        return;
       }
 
       if (interaction.commandName === "dashboard") {
@@ -2945,6 +3458,29 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       // MITARBEITER PANEL BUTTONS
+      if (interaction.customId.startsWith("ticket_open_")) {
+        const categoryKey = interaction.customId.replace("ticket_open_", "");
+        return createTicketFromButton(interaction, categoryKey);
+      }
+
+      if (interaction.customId === "ticket_claim") {
+        return claimTicket(interaction);
+      }
+
+      if (interaction.customId === "ticket_request_close") {
+        return requestTicketClose(interaction);
+      }
+
+      if (interaction.customId.startsWith("ticket_close_confirm_")) {
+        const ticketId = Number(interaction.customId.replace("ticket_close_confirm_", ""));
+        return handleTicketCloseDecision(interaction, ticketId, "confirm");
+      }
+
+      if (interaction.customId.startsWith("ticket_close_cancel_")) {
+        const ticketId = Number(interaction.customId.replace("ticket_close_cancel_", ""));
+        return handleTicketCloseDecision(interaction, ticketId, "cancel");
+      }
+
       if (interaction.customId === "open_absence_modal") {
         const modal = new ModalBuilder().setCustomId("absence_modal").setTitle("Abmeldung erstellen");
         modal.addComponents(
