@@ -3031,13 +3031,8 @@ client.once("clientReady", async () => {
 
   try {
     await initDatabase();
-    console.log("🔄 Starte Slash-Command-Registrierung...");
-    const commandsOk = await registerCommands();
-    if (commandsOk) {
-      console.log("✅ Slash-Command-Registrierung abgeschlossen.");
-    } else {
-      console.log("⚠️ Slash-Command-Registrierung nicht abgeschlossen. Bot startet trotzdem weiter.");
-    }
+    console.log("✅ Slash-Command-Registrierung wird nicht beim Bot-Start ausgeführt.");
+    console.log("ℹ️ Nutze dafür separat: npm run deploy-commands");
     await syncEmployeeRoles();
     await updateTotalWorktimeMessage();
     await updateWeeklyWorktimeMessage();
