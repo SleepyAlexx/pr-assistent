@@ -3,6 +3,7 @@
 // Update: 3-Stunden-Pflicht entfernt, Bungalow- & Essensstand-Buchungen ergänzt, Status gesetzt.
 // Update: Teamupdate-Rollen korrigiert, Probe-Mitarbeiter und Casino-Mitarbeiter ergänzt, Verwarnungen aus Teamupdate entfernt.
 // Update: Ticket-System mit privaten Threads, Claim-System, Add/Remove/Rename/Close/Open Commands ergänzt.
+// Update: Teammitglieder mit berechtigten Rollen werden automatisch in private Ticket-Threads eingeladen + @everyone Ping.
 // Wichtig: DISCORD_TOKEN, CLIENT_ID, GUILD_ID und DATABASE_URL in der .env eintragen.
 
 if (process.env.NODE_ENV !== "production") require("dotenv").config();
@@ -928,20 +929,33 @@ async function ensureTicketThread(interaction) {
 
 async function addAllowedStaffToThread(thread, categoryKey) {
   const guild = await client.guilds.fetch(GUILD_ID);
-  const members = await guild.members.fetch().catch(() => null);
-  if (!members) return;
+  const members = await guild.members.fetch().catch((err) => {
+    console.error("❌ Mitglieder konnten für Ticket-Zugriff nicht geladen werden:", err);
+    return null;
+  });
+
+  if (!members) return { added: 0, failed: 0 };
 
   const allowedRoles = categoryRoles(categoryKey);
   const added = new Set();
+  let failed = 0;
 
   for (const [, member] of members) {
     if (member.user.bot) continue;
     if (added.has(member.id)) continue;
     if (!memberHasAnyRole(member, allowedRoles)) continue;
 
-    added.add(member.id);
-    await thread.members.add(member.id).catch(() => null);
+    try {
+      await thread.members.add(member.id);
+      added.add(member.id);
+    } catch (err) {
+      failed++;
+      console.error(`❌ Konnte ${member.user.tag} nicht zum Ticket-Thread hinzufügen:`, err?.message || err);
+    }
   }
+
+  console.log(`🎫 Ticket-Zugriff: ${added.size} Teammitglieder hinzugefügt, ${failed} fehlgeschlagen (${categoryKey}).`);
+  return { added: added.size, failed };
 }
 
 async function createTicketFromButton(interaction, categoryKey) {
@@ -964,8 +978,11 @@ async function createTicketFromButton(interaction, categoryKey) {
     reason: `Ticket erstellt von ${interaction.user.tag}`,
   });
 
-  await thread.members.add(interaction.user.id).catch(() => null);
-  await addAllowedStaffToThread(thread, categoryKey);
+  await thread.members.add(interaction.user.id).catch((err) => {
+    console.error("❌ Ticket-Ersteller konnte nicht zum Thread hinzugefügt werden:", err?.message || err);
+  });
+
+  const staffAddResult = await addAllowedStaffToThread(thread, categoryKey);
 
   const insert = await query(
     `
@@ -995,9 +1012,13 @@ async function createTicketFromButton(interaction, categoryKey) {
     .setTimestamp();
 
   await thread.send({
-    content: `<@${interaction.user.id}>`,
+    content: `@everyone <@${interaction.user.id}>`,
     embeds: [embed],
     components: [ticketThreadButtons()],
+    allowedMentions: {
+      parse: ["everyone"],
+      users: [interaction.user.id],
+    },
   });
 
   await interaction.editReply({ content: `✅ Dein Ticket wurde erstellt: ${thread}` });
