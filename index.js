@@ -4,7 +4,7 @@
 // Update: Teamupdate-Rollen korrigiert, Probe-Mitarbeiter und Casino-Mitarbeiter ergänzt, Verwarnungen aus Teamupdate entfernt.
 // Update: Ticket-System mit öffentlichen Threads, Claim-System, Add/Remove/Rename/Close/Open Commands ergänzt.
 // Update: Private Ticket-Threads + stabilerer Member-Fetch ohne Query + Debug-Logs im Ticket-Debug-Channel.
-// Update: ticket-rename Sofort-Antwort-Fix, Bürgerrollen für Slash-Commands gesperrt und nicht automatisch in Tickets eingeladen.
+// Update: ticket-rename stabilisiert: Ticket-Commands nutzen die Thread-ID, Rename behält Kategorie-Endung, Bürgerrollen bleiben blockiert.
 // Wichtig: DISCORD_TOKEN, CLIENT_ID, GUILD_ID und DATABASE_URL in der .env eintragen.
 
 if (process.env.NODE_ENV !== "production") require("dotenv").config();
@@ -935,6 +935,34 @@ function categoryRoles(categoryKey) {
   return category?.access === "management" ? TICKET_MANAGEMENT_ROLE_IDS : TICKET_STAFF_ROLE_IDS;
 }
 
+function detectTicketCategoryFromName(name = "") {
+  const lower = String(name || "").toLowerCase();
+
+  for (const [key, category] of Object.entries(TICKET_CATEGORIES)) {
+    if (lower.includes(category.short.toLowerCase())) return key;
+  }
+
+  return null;
+}
+
+function formatRenamedTicketName(rawName, categoryKey) {
+  const category = TICKET_CATEGORIES[categoryKey];
+  const cleaned = cleanTicketName(rawName);
+
+  if (!category) return cleaned.slice(0, 95);
+
+  // Wichtig: Die Kategorie bleibt immer im Namen erhalten.
+  // Dadurch bleiben spätere Commands stabil, auch wenn der Thread manuell/über Command umbenannt wurde.
+  const lower = cleaned.toLowerCase();
+  const suffix = `${category.emoji}-${category.short}`;
+
+  if (lower.includes(category.short.toLowerCase())) {
+    return cleaned.slice(0, 95);
+  }
+
+  return `${cleaned}-${suffix}`.slice(0, 95);
+}
+
 function memberHasAnyRole(member, roleIds) {
   if (!member?.roles?.cache) return false;
   return roleIds.some((roleId) => member.roles.cache.has(roleId));
@@ -956,8 +984,45 @@ function canUseTicketStaffCommands(member, categoryKey) {
 }
 
 async function getTicketByThread(threadId) {
-  const res = await query(`SELECT * FROM ticket_records WHERE thread_id = $1`, [threadId]);
+  const res = await query(`SELECT * FROM ticket_records WHERE thread_id = $1`, [threadId]).catch((err) => {
+    console.error("❌ Ticket-Datenbankabfrage fehlgeschlagen:", err);
+    return { rows: [] };
+  });
+
   return res.rows[0] || null;
+}
+
+async function getOrRecoverTicketFromThread(thread) {
+  if (!thread?.id) return null;
+
+  const existing = await getTicketByThread(thread.id);
+  if (existing) return existing;
+
+  // Fallback: Falls ein altes Ticket nicht mehr in der DB gefunden wird,
+  // versuchen wir die Kategorie aus dem Threadnamen zu erkennen und registrieren es neu.
+  // So brechen Commands nicht direkt ab, nur weil der Name geändert wurde oder ein DB-Eintrag fehlt.
+  const categoryKey = detectTicketCategoryFromName(thread.name);
+  if (!categoryKey) return null;
+
+  const baseName = `${TICKET_CATEGORIES[categoryKey].emoji}-${TICKET_CATEGORIES[categoryKey].short}-anfrage`;
+
+  const inserted = await query(
+    `
+    INSERT INTO ticket_records (thread_id, opener_id, category, base_name, current_name)
+    VALUES ($1, $2, $3, $4, $5)
+    ON CONFLICT (thread_id) DO UPDATE
+    SET category = EXCLUDED.category,
+        current_name = EXCLUDED.current_name,
+        updated_at = NOW()
+    RETURNING *;
+    `,
+    [thread.id, thread.ownerId || "unknown", categoryKey, baseName, thread.name]
+  ).catch((err) => {
+    console.error("❌ Ticket-Recovery fehlgeschlagen:", err);
+    return { rows: [] };
+  });
+
+  return inserted.rows[0] || null;
 }
 
 function getRuntimeRemovedSet(threadId) {
@@ -1048,9 +1113,14 @@ async function ensureTicketThread(interaction) {
     return null;
   }
 
-  const ticket = await getTicketByThread(interaction.channel.id);
+  const ticket = await getOrRecoverTicketFromThread(interaction.channel);
   if (!ticket) {
-    await interaction.reply({ content: "❌ Dieser Thread ist kein bekanntes Ticket.", ephemeral: true });
+    await interaction.reply({
+      content:
+        "❌ Dieser Thread ist kein bekanntes Ticket. " +
+        "Bitte nutze Ticket-Commands nur in Tickets, die über das Ticketpanel erstellt wurden.",
+      ephemeral: true,
+    });
     return null;
   }
 
@@ -3070,7 +3140,7 @@ client.on("interactionCreate", async (interaction) => {
         }
 
         const rawName = interaction.options.getString("name", true);
-        const newName = cleanTicketName(rawName).slice(0, 95);
+        const newName = formatRenamedTicketName(rawName, ticket.category);
 
         if (!newName || newName.length < 2) {
           await interaction.editReply({ content: "❌ Bitte gib einen gültigen Ticketnamen an." });
