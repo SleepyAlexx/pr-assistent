@@ -1,6 +1,7 @@
 // Pearls Bot - Komplettscript
 // Grundlage: aktuelles CaffeeContainer-Script, angepasst auf den neuen Pearls-Discord.
 // Update: 3-Stunden-Pflicht entfernt, Bungalow- & Essensstand-Buchungen ergänzt, Status gesetzt.
+// Update: Teamupdate-Rollen korrigiert, Probe-Mitarbeiter und Casino-Mitarbeiter ergänzt, Verwarnungen aus Teamupdate entfernt.
 // Wichtig: DISCORD_TOKEN, CLIENT_ID, GUILD_ID und DATABASE_URL in der .env eintragen.
 
 if (process.env.NODE_ENV !== "production") require("dotenv").config();
@@ -46,11 +47,19 @@ const HIGH_COMMAND_ROLE_ID = "1512314174045294603";
 
 const WARNING_ROLE_1_ID = "1512314173844095168";
 const WARNING_ROLE_2_ID = "1512314173844095167";
+
+// Teamupdate-Rollen
 const TEAMUPDATE_EMPLOYEE_ROLE_ID = "1512314173936238653";
-const TEAMUPDATE_PROBE_MANAGER_ROLE_ID = "1512314173936238659";
+const TEAMUPDATE_PROBE_EMPLOYEE_ROLE_ID = "1512314173936238652";
+const TEAMUPDATE_EMPLOYEE_BASE_ROLE_ID = "1512314173936238656";
+
+const TEAMUPDATE_MANAGEMENT_BASE_ROLE_ID = "1512314174045294606";
+const TEAMUPDATE_PROBE_MANAGER_ROLE_ID = "1512314173936238658";
 const TEAMUPDATE_MANAGER_ROLE_ID = "1512314173936238659";
-const TEAMUPDATE_MANAGER_BASE_ROLE_ID = "1512314173936238659";
 const TEAMUPDATE_PERSONAL_MANAGER_ROLE_ID = "1512314173936238660";
+
+const TEAMUPDATE_CASINO_EMPLOYEE_ROLE_ID = "1512619917915197580";
+const TEAMUPDATE_CASINO_BASE_ROLE_ID = "1512619798234923058";
 
 // =====================
 // CHANNELS
@@ -94,8 +103,9 @@ const TERMINATION_REMOVE_ROLE_IDS = [
 ];
 
 const REGISTRATION_ROLE_IDS = [
-  PROBE_ROLE_ID,
-  EMPLOYEE_ROLE_ID,
+  "1512314173844095170",
+  "1512314173844095169",
+  "1512314173844095175",
 ];
 
 // =====================
@@ -601,12 +611,12 @@ function teamUpdateRoleSelect(customId) {
       .setCustomId(customId)
       .setPlaceholder("Welche Rolle soll vergeben werden?")
       .addOptions(
-        { label: "Mitarbeiter", value: "employee", description: "Vergibt Mitarbeiter und entfernt Probezeit" },
-        { label: "Probe Manager", value: "probe_manager", description: "Vergibt Probe Manager + Verwaltungsrolle" },
-        { label: "Manager", value: "manager", description: "Vergibt Manager und entfernt Probe Manager" },
-        { label: "Personal Manager", value: "personal_manager", description: "Vergibt Personal Manager + Verwaltungsrolle" },
-        { label: "Verwarnung 1", value: "warning_1", description: "Vergibt Verwarnung 1" },
-        { label: "Verwarnung 2", value: "warning_2", description: "Vergibt Verwarnung 2" }
+        { label: "Probe Mitarbeiter", value: "probe_employee", description: "Vergibt Probe Mitarbeiter + Basisrolle" },
+        { label: "Mitarbeiter", value: "employee", description: "Vergibt Mitarbeiter + Basisrolle" },
+        { label: "Casino Mitarbeiter", value: "casino_employee", description: "Vergibt Casino Mitarbeiter + Casino-Basisrolle" },
+        { label: "Probe Manager", value: "probe_manager", description: "Vergibt Probe Manager + Leitungsbasis" },
+        { label: "Manager", value: "manager", description: "Vergibt Manager + Leitungsbasis" },
+        { label: "Personal Manager", value: "personal_manager", description: "Vergibt Personal Manager + Leitungsbasis" }
       )
   );
 }
@@ -776,30 +786,38 @@ async function applyTeamUpdateRoles(targetMember, updateType) {
   let roleIds = [];
   let removeRoleIds = [];
 
+  if (updateType === "probe_employee") {
+    roleIds = [TEAMUPDATE_PROBE_EMPLOYEE_ROLE_ID, TEAMUPDATE_EMPLOYEE_BASE_ROLE_ID];
+    removeRoleIds = [];
+  }
+
   if (updateType === "employee") {
-    roleIds = [TEAMUPDATE_EMPLOYEE_ROLE_ID];
-    removeRoleIds = [PROBE_ROLE_ID];
+    roleIds = [TEAMUPDATE_EMPLOYEE_ROLE_ID, TEAMUPDATE_EMPLOYEE_BASE_ROLE_ID];
+    removeRoleIds = [TEAMUPDATE_PROBE_EMPLOYEE_ROLE_ID, PROBE_ROLE_ID];
+  }
+
+  if (updateType === "casino_employee") {
+    roleIds = [TEAMUPDATE_CASINO_EMPLOYEE_ROLE_ID, TEAMUPDATE_CASINO_BASE_ROLE_ID];
+    removeRoleIds = [];
   }
 
   if (updateType === "probe_manager") {
-    roleIds = [TEAMUPDATE_PROBE_MANAGER_ROLE_ID, TEAMUPDATE_MANAGER_BASE_ROLE_ID];
+    roleIds = [TEAMUPDATE_MANAGEMENT_BASE_ROLE_ID, TEAMUPDATE_PROBE_MANAGER_ROLE_ID];
+    removeRoleIds = [];
   }
 
   if (updateType === "manager") {
-    roleIds = [TEAMUPDATE_MANAGER_ROLE_ID];
+    roleIds = [TEAMUPDATE_MANAGER_ROLE_ID, TEAMUPDATE_MANAGEMENT_BASE_ROLE_ID];
     removeRoleIds = [TEAMUPDATE_PROBE_MANAGER_ROLE_ID];
   }
 
   if (updateType === "personal_manager") {
-    roleIds = [TEAMUPDATE_PERSONAL_MANAGER_ROLE_ID, TEAMUPDATE_MANAGER_BASE_ROLE_ID];
+    roleIds = [TEAMUPDATE_PERSONAL_MANAGER_ROLE_ID, TEAMUPDATE_MANAGEMENT_BASE_ROLE_ID];
+    removeRoleIds = [];
   }
 
-  if (updateType === "warning_1") {
-    roleIds = [WARNING_ROLE_1_ID];
-  }
-
-  if (updateType === "warning_2") {
-    roleIds = [WARNING_ROLE_2_ID];
+  if (!roleIds.length) {
+    throw new Error(`Unbekannter Teamupdate-Typ: ${updateType}`);
   }
 
   const addResult = await safeAddRoles(targetMember, roleIds);
@@ -3381,10 +3399,9 @@ client.on("interactionCreate", async (interaction) => {
           roleText = "\n✅ Alle Registrierungsrollen wurden vergeben.";
         }
 
-        await ensureEmployee(interaction.user.id);
-        await query(`UPDATE employees SET left_server = FALSE WHERE user_id = $1`, [interaction.user.id]);
-        await updateTotalWorktimeMessage();
-        await updateWeeklyWorktimeMessage();
+        // Gäste werden bei der Registrierung nicht automatisch als Mitarbeiter angelegt.
+        // In die Zeitlisten kommt ein User erst, wenn er später die Mitarbeiter-Rolle erhält
+        // oder sich mit Mitarbeiter-Rolle einstempelt.
 
         return interaction.reply({
           content: `✅ Registrierung abgeschlossen.
