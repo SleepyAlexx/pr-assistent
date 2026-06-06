@@ -4,7 +4,7 @@
 // Update: Teamupdate-Rollen korrigiert, Probe-Mitarbeiter und Casino-Mitarbeiter ergänzt, Verwarnungen aus Teamupdate entfernt.
 // Update: Ticket-System mit öffentlichen Threads, Claim-System, Add/Remove/Rename/Close/Open Commands ergänzt.
 // Update: Private Ticket-Threads + stabilerer Member-Fetch ohne Query + Debug-Logs im Ticket-Debug-Channel.
-// Update: ticket-rename stabilisiert: Ticket-Commands nutzen die Thread-ID, Rename behält Kategorie-Endung, Bürgerrollen bleiben blockiert.
+// Update: Ticket-System final stabilisiert: Private Threads, Strict Remove, stabiles Rename/Close, Bürgerrollen blockiert.
 // Wichtig: DISCORD_TOKEN, CLIENT_ID, GUILD_ID und DATABASE_URL in der .env eintragen.
 
 if (process.env.NODE_ENV !== "production") require("dotenv").config();
@@ -907,10 +907,10 @@ function ticketThreadButtons() {
   );
 }
 
-function ticketCloseButtons(ticketId) {
+function ticketCloseButtons(threadId) {
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`ticket_close_confirm_${ticketId}`).setLabel("Schließen").setEmoji("✅").setStyle(ButtonStyle.Danger),
-    new ButtonBuilder().setCustomId(`ticket_close_cancel_${ticketId}`).setLabel("Abbrechen").setEmoji("❌").setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId(`ticket_close_confirm_${threadId}`).setLabel("Schließen").setEmoji("✅").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(`ticket_close_cancel_${threadId}`).setLabel("Abbrechen").setEmoji("❌").setStyle(ButtonStyle.Secondary)
   );
 }
 
@@ -1023,6 +1023,55 @@ async function getOrRecoverTicketFromThread(thread) {
   });
 
   return inserted.rows[0] || null;
+}
+
+async function getTicketFromCloseToken(token) {
+  // Neue Buttons speichern die Thread-ID im CustomId. Alte Buttons mit Ticket-ID werden weiterhin unterstützt.
+  const clean = String(token || "");
+
+  let res = await query(`SELECT * FROM ticket_records WHERE thread_id = $1`, [clean]).catch(() => ({ rows: [] }));
+  if (res.rows[0]) return res.rows[0];
+
+  if (/^\d+$/.test(clean)) {
+    res = await query(`SELECT * FROM ticket_records WHERE id = $1`, [Number(clean)]).catch(() => ({ rows: [] }));
+    if (res.rows[0]) return res.rows[0];
+  }
+
+  return null;
+}
+
+function disableActionRows(rows = []) {
+  try {
+    return rows.map((row) => {
+      const newRow = ActionRowBuilder.from(row);
+      newRow.components.forEach((component) => {
+        if (typeof component.setDisabled === "function") component.setDisabled(true);
+      });
+      return newRow;
+    });
+  } catch (err) {
+    console.error("⚠️ Ticket-Buttons konnten nicht deaktiviert werden:", err?.message || err);
+    return [];
+  }
+}
+
+function getRestoreTicketName(ticket) {
+  const raw = ticket?.current_name || ticket?.base_name || "ticket";
+  return String(raw).replace(/^closing-+/i, "").slice(0, 95);
+}
+
+function getClosingTicketName(ticket) {
+  return `closing-${getRestoreTicketName(ticket)}`.slice(0, 95);
+}
+
+function getTicketActorPing(ticket) {
+  if (ticket?.claimed_by) return `<@${ticket.claimed_by}>`;
+  if (ticket?.close_requested_by) return `<@${ticket.close_requested_by}>`;
+  return "";
+}
+
+function getSafeInteractionChannel(interaction) {
+  return interaction.channel?.isThread?.() ? interaction.channel : null;
 }
 
 function getRuntimeRemovedSet(threadId) {
@@ -1301,11 +1350,16 @@ async function claimTicket(interaction) {
     return interaction.reply({ content: "❌ Du darfst dieses Ticket nicht übernehmen.", ephemeral: true });
   }
 
+  await interaction.deferReply({ ephemeral: false });
+
   const category = TICKET_CATEGORIES[ticket.category];
   const handlerName = memberTicketName(interaction.member, interaction.user);
   const newName = `${handlerName}-${category.emoji}-${category.short}`.slice(0, 95);
 
-  await interaction.channel.setName(newName).catch(() => null);
+  await interaction.channel.setName(newName, `Ticket übernommen von ${interaction.user.tag}`).catch((err) => {
+    console.error("❌ Ticket konnte beim Claim nicht umbenannt werden:", err?.message || err);
+  });
+
   await query(
     `
     UPDATE ticket_records
@@ -1316,7 +1370,7 @@ async function claimTicket(interaction) {
     WHERE thread_id = $1;
     `,
     [interaction.channel.id, interaction.user.id, newName]
-  );
+  ).catch((err) => console.error("❌ Ticket-Claim DB-Update fehlgeschlagen:", err));
 
   const embed = new EmbedBuilder()
     .setColor(0x2ecc71)
@@ -1324,7 +1378,7 @@ async function claimTicket(interaction) {
     .setDescription(`<@${interaction.user.id}> hat dieses Ticket übernommen.`)
     .setTimestamp();
 
-  await interaction.reply({ embeds: [embed] });
+  await interaction.editReply({ embeds: [embed] });
 }
 
 async function requestTicketClose(interaction) {
@@ -1335,10 +1389,25 @@ async function requestTicketClose(interaction) {
     return interaction.reply({ content: "❌ Du darfst dieses Ticket nicht schließen.", ephemeral: true });
   }
 
-  const deadline = new Date(Date.now() + TICKET_CLOSE_AFTER_MS);
-  const closingName = `closing-${ticket.current_name || ticket.base_name}`.slice(0, 95);
+  await interaction.deferReply({ ephemeral: true });
 
-  await interaction.channel.setName(closingName).catch(() => null);
+  const thread = getSafeInteractionChannel(interaction);
+  if (!thread) {
+    return interaction.editReply({ content: "❌ Dieser Command kann nur direkt im Ticket-Thread genutzt werden." });
+  }
+
+  if (ticket.status === "closing_requested") {
+    return interaction.editReply({ content: "⚠️ Für dieses Ticket läuft bereits eine Schließungsanfrage." });
+  }
+
+  const deadline = new Date(Date.now() + TICKET_CLOSE_AFTER_MS);
+  const closingName = getClosingTicketName(ticket);
+
+  try {
+    await thread.setName(closingName, `Schließungsanfrage von ${interaction.user.tag}`);
+  } catch (err) {
+    console.error("❌ Ticket konnte für Schließung nicht umbenannt werden:", err);
+  }
 
   const embed = new EmbedBuilder()
     .setColor(0xe67e22)
@@ -1352,11 +1421,18 @@ async function requestTicketClose(interaction) {
     .setFooter({ text: "Pearls • Ticket-Schließung" })
     .setTimestamp();
 
-  const msg = await interaction.channel.send({
-    content: `<@${ticket.opener_id}>`,
-    embeds: [embed],
-    components: [ticketCloseButtons(ticket.id)],
-  });
+  let msg = null;
+  try {
+    msg = await thread.send({
+      content: `<@${ticket.opener_id}>`,
+      embeds: [embed],
+      components: [ticketCloseButtons(thread.id)],
+      allowedMentions: { users: [ticket.opener_id] },
+    });
+  } catch (err) {
+    console.error("❌ Schließungsnachricht konnte nicht gesendet werden:", err);
+    return interaction.editReply({ content: "❌ Die Schließungsanfrage konnte nicht gesendet werden. Prüfe Bot-Rechte im Thread." });
+  }
 
   await query(
     `
@@ -1367,35 +1443,62 @@ async function requestTicketClose(interaction) {
         close_deadline_at = $3,
         close_message_id = $4,
         updated_at = NOW()
-    WHERE id = $1;
+    WHERE thread_id = $1;
     `,
-    [ticket.id, interaction.user.id, deadline, msg.id]
-  );
+    [thread.id, interaction.user.id, deadline, msg.id]
+  ).catch((err) => console.error("❌ Ticket-Close DB-Update fehlgeschlagen:", err));
 
-  return interaction.reply({ content: "✅ Schließungsanfrage wurde gestellt.", ephemeral: true });
+  return interaction.editReply({ content: "✅ Schließungsanfrage wurde gestellt." });
 }
 
-async function handleTicketCloseDecision(interaction, ticketId, decision) {
-  const res = await query(`SELECT * FROM ticket_records WHERE id = $1`, [ticketId]);
-  const ticket = res.rows[0];
-  if (!ticket) return interaction.reply({ content: "❌ Ticket wurde nicht gefunden.", ephemeral: true });
+async function handleTicketCloseDecision(interaction, closeToken, decision) {
+  // Sofort bestätigen, damit die Buttons niemals bei "Anwendung reagiert nicht" hängen bleiben.
+  await interaction.deferUpdate().catch(() => null);
 
-  if (interaction.user.id !== ticket.opener_id) {
-    return interaction.reply({ content: "❌ Nur der Ticket-Ersteller darf diese Schließung bestätigen oder abbrechen.", ephemeral: true });
-  }
-
-  const thread = interaction.channel;
-
-  if (decision === "confirm") {
-    await interaction.reply({ content: "✅ Ticket wird geschlossen und gelöscht.", ephemeral: true });
-    await query(`UPDATE ticket_records SET status = 'closed', updated_at = NOW() WHERE id = $1`, [ticket.id]);
-    await thread.send({ content: `✅ ・TICKET GESCHLOSSEN\n\n<@${interaction.user.id}> hat die Schließung bestätigt. Der Thread wird nun gelöscht.` }).catch(() => null);
-    setTimeout(() => thread.delete("Ticket-Schließung bestätigt").catch(() => null), 2500);
+  const ticket = await getTicketFromCloseToken(closeToken);
+  if (!ticket) {
+    await interaction.followUp({ content: "❌ Ticket wurde nicht gefunden.", ephemeral: true }).catch(() => null);
     return;
   }
 
-  const restoreName = ticket.current_name || ticket.base_name;
-  await thread.setName(restoreName).catch(() => null);
+  if (interaction.user.id !== ticket.opener_id) {
+    await interaction.followUp({ content: "❌ Nur der Ticket-Ersteller darf diese Schließung bestätigen oder abbrechen.", ephemeral: true }).catch(() => null);
+    return;
+  }
+
+  const thread = interaction.channel?.isThread?.() ? interaction.channel : await client.channels.fetch(ticket.thread_id).catch(() => null);
+  if (!thread) {
+    await interaction.followUp({ content: "❌ Der Ticket-Thread wurde nicht gefunden.", ephemeral: true }).catch(() => null);
+    return;
+  }
+
+  await interaction.message.edit({ components: disableActionRows(interaction.message.components) }).catch(() => null);
+
+  if (decision === "confirm") {
+    await query(`UPDATE ticket_records SET status = 'closed', updated_at = NOW() WHERE thread_id = $1`, [ticket.thread_id]).catch((err) => {
+      console.error("❌ Ticket-Confirm DB-Update fehlgeschlagen:", err);
+    });
+
+    await thread.send({
+      content:
+        `✅ ・TICKET GESCHLOSSEN\n\n` +
+        `<@${interaction.user.id}> hat die Schließung bestätigt.\n` +
+        `Der Thread wird nun gelöscht.`,
+      allowedMentions: { users: [interaction.user.id] },
+    }).catch(() => null);
+
+    setTimeout(() => thread.delete("Ticket-Schließung bestätigt").catch((err) => {
+      console.error("❌ Ticket-Thread konnte nicht gelöscht werden:", err?.message || err);
+    }), 2500);
+    return;
+  }
+
+  const restoreName = getRestoreTicketName(ticket);
+
+  await thread.setName(restoreName, `Schließung abgebrochen von ${interaction.user.tag}`).catch((err) => {
+    console.error("❌ Ticket konnte nach Abbruch nicht zurückbenannt werden:", err?.message || err);
+  });
+
   await query(
     `
     UPDATE ticket_records
@@ -1405,19 +1508,19 @@ async function handleTicketCloseDecision(interaction, ticketId, decision) {
         close_deadline_at = NULL,
         close_message_id = NULL,
         updated_at = NOW()
-    WHERE id = $1;
+    WHERE thread_id = $1;
     `,
-    [ticket.id]
-  );
+    [ticket.thread_id]
+  ).catch((err) => console.error("❌ Ticket-Cancel DB-Update fehlgeschlagen:", err));
 
-  const ping = ticket.claimed_by ? `<@${ticket.claimed_by}>` : ticket.close_requested_by ? `<@${ticket.close_requested_by}>` : "";
-  await interaction.update({ components: [] }).catch(() => null);
+  const ping = getTicketActorPing(ticket);
   await thread.send({
     content:
       `❌ ・SCHLIESSUNG ABGEBROCHEN\n\n` +
       `<@${interaction.user.id}> hat die Schließungsanfrage abgelehnt.\n\n` +
-      `Das Ticket bleibt geöffnet. ${ping ? `${ping} wurde benachrichtigt.` : ""}`,
-  });
+      `Das Ticket bleibt geöffnet.${ping ? ` ${ping} wurde benachrichtigt.` : ""}`,
+    allowedMentions: { users: [interaction.user.id, ticket.claimed_by, ticket.close_requested_by].filter(Boolean) },
+  }).catch(() => null);
 }
 
 async function checkTicketCloseDeadlines() {
@@ -1433,9 +1536,15 @@ async function checkTicketCloseDeadlines() {
 
   for (const ticket of res.rows) {
     const channel = await client.channels.fetch(ticket.thread_id).catch(() => null);
-    await query(`UPDATE ticket_records SET status = 'closed', updated_at = NOW() WHERE id = $1`, [ticket.id]).catch(() => null);
+    await query(`UPDATE ticket_records SET status = 'closed', updated_at = NOW() WHERE thread_id = $1`, [ticket.thread_id]).catch(() => null);
+
     if (channel) {
-      await channel.send({ content: "🔒 ・TICKET AUTOMATISCH GESCHLOSSEN\n\nDie Schließungsanfrage wurde nicht innerhalb von 2 Tagen beantwortet. Der Thread wird nun gelöscht." }).catch(() => null);
+      await channel.send({
+        content:
+          "🔒 ・TICKET AUTOMATISCH GESCHLOSSEN\n\n" +
+          "Die Schließungsanfrage wurde nicht innerhalb von 2 Tagen beantwortet. Der Thread wird nun gelöscht.",
+      }).catch(() => null);
+
       setTimeout(() => channel.delete("Ticket-Frist abgelaufen").catch(() => null), 2500);
     }
   }
@@ -3119,8 +3228,6 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       if (interaction.commandName === "ticket-rename") {
-        // Wichtig: sofort deferReply, damit Discord nicht mit "Anwendung reagiert nicht" abbricht,
-        // falls Datenbank oder Discord-Thread-Rename länger als 3 Sekunden brauchen.
         await interaction.deferReply({ ephemeral: false });
 
         if (!interaction.channel?.isThread?.()) {
@@ -3128,7 +3235,7 @@ client.on("interactionCreate", async (interaction) => {
           return;
         }
 
-        const ticket = await getTicketByThread(interaction.channel.id);
+        const ticket = await getOrRecoverTicketFromThread(interaction.channel);
         if (!ticket) {
           await interaction.editReply({ content: "❌ Dieser Thread ist kein bekanntes Ticket." });
           return;
@@ -3180,12 +3287,28 @@ client.on("interactionCreate", async (interaction) => {
         if (!canUseTicketStaffCommands(interaction.member, ticket.category)) {
           return interaction.reply({ content: "❌ Du darfst dieses Ticket nicht wieder öffnen.", ephemeral: true });
         }
-        const restoreName = ticket.current_name || ticket.base_name;
+
+        await interaction.deferReply({ ephemeral: false });
+
+        const restoreName = getRestoreTicketName(ticket);
         await interaction.channel.setLocked(false).catch(() => null);
         await interaction.channel.setArchived(false).catch(() => null);
-        await interaction.channel.setName(restoreName).catch(() => null);
-        await query(`UPDATE ticket_records SET status = 'open', updated_at = NOW() WHERE thread_id = $1`, [interaction.channel.id]);
-        await interaction.reply({ content: `🔓 <@${interaction.user.id}> hat das Ticket wieder geöffnet.` });
+        await interaction.channel.setName(restoreName, `Ticket wieder geöffnet von ${interaction.user.tag}`).catch(() => null);
+        await query(
+          `
+          UPDATE ticket_records
+          SET status = 'open',
+              close_requested_by = NULL,
+              close_requested_at = NULL,
+              close_deadline_at = NULL,
+              close_message_id = NULL,
+              updated_at = NOW()
+          WHERE thread_id = $1
+          `,
+          [interaction.channel.id]
+        ).catch((err) => console.error("❌ Ticket-Open DB-Update fehlgeschlagen:", err));
+
+        await interaction.editReply({ content: `🔓 <@${interaction.user.id}> hat das Ticket wieder geöffnet.` });
         return;
       }
 
@@ -3823,13 +3946,13 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       if (interaction.customId.startsWith("ticket_close_confirm_")) {
-        const ticketId = Number(interaction.customId.replace("ticket_close_confirm_", ""));
-        return handleTicketCloseDecision(interaction, ticketId, "confirm");
+        const closeToken = interaction.customId.replace("ticket_close_confirm_", "");
+        return handleTicketCloseDecision(interaction, closeToken, "confirm");
       }
 
       if (interaction.customId.startsWith("ticket_close_cancel_")) {
-        const ticketId = Number(interaction.customId.replace("ticket_close_cancel_", ""));
-        return handleTicketCloseDecision(interaction, ticketId, "cancel");
+        const closeToken = interaction.customId.replace("ticket_close_cancel_", "");
+        return handleTicketCloseDecision(interaction, closeToken, "cancel");
       }
 
       if (interaction.customId === "open_absence_modal") {
