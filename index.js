@@ -451,6 +451,16 @@ async function initDatabase() {
     );
   `);
 
+  await query(`
+    CREATE TABLE IF NOT EXISTS ticket_removed_members (
+      thread_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      removed_by TEXT NOT NULL,
+      removed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (thread_id, user_id)
+    );
+  `);
+
   // Keine alten Fivebot-Zeiten mehr importieren.
   // Bestehende Zeiten bleiben in der Datenbank erhalten.
 
@@ -926,6 +936,28 @@ async function getTicketByThread(threadId) {
   return res.rows[0] || null;
 }
 
+async function getRemovedTicketUserIds(threadId) {
+  const res = await query(`SELECT user_id FROM ticket_removed_members WHERE thread_id = $1`, [threadId]).catch(() => ({ rows: [] }));
+  return new Set(res.rows.map((row) => row.user_id));
+}
+
+async function markTicketUserRemoved(threadId, userId, removedBy) {
+  await query(
+    `
+    INSERT INTO ticket_removed_members (thread_id, user_id, removed_by)
+    VALUES ($1, $2, $3)
+    ON CONFLICT (thread_id, user_id)
+    DO UPDATE SET removed_by = EXCLUDED.removed_by,
+                  removed_at = NOW();
+    `,
+    [threadId, userId, removedBy]
+  );
+}
+
+async function unmarkTicketUserRemoved(threadId, userId) {
+  await query(`DELETE FROM ticket_removed_members WHERE thread_id = $1 AND user_id = $2`, [threadId, userId]).catch(() => null);
+}
+
 async function ensureTicketThread(interaction) {
   if (!interaction.channel?.isThread?.()) {
     await interaction.reply({ content: "❌ Dieser Command kann nur in einem Ticket-Thread genutzt werden.", ephemeral: true });
@@ -973,6 +1005,7 @@ async function addAllowedStaffToThread(thread, categoryKey) {
   });
 
   const allowedRoles = TICKET_AUTO_ADD_ROLE_IDS;
+  const removedUserIds = await getRemovedTicketUserIds(thread.id);
   const fetchResult = await fetchAllGuildMembersForTickets(guild);
   const members = fetchResult.members;
 
@@ -997,6 +1030,7 @@ async function addAllowedStaffToThread(thread, categoryKey) {
 
   const candidates = members.filter((member) => {
     if (!member || member.user?.bot) return false;
+    if (removedUserIds.has(member.id)) return false;
     return memberHasAnyRole(member, allowedRoles);
   });
 
@@ -2880,7 +2914,10 @@ client.on("interactionCreate", async (interaction) => {
           return interaction.reply({ content: "❌ Du darfst dieses Ticket nicht verwalten.", ephemeral: true });
         }
         const target = interaction.options.getUser("user");
-        await interaction.channel.members.add(target.id).catch(() => null);
+        await unmarkTicketUserRemoved(interaction.channel.id, target.id);
+        await interaction.channel.members.add(target.id).catch((err) => {
+          console.error(`❌ Konnte ${target.tag} nicht zum Ticket hinzufügen:`, err?.message || err);
+        });
         await interaction.reply({ content: `➕ <@${interaction.user.id}> hat ${target} zum Ticket hinzugefügt.` });
         return;
       }
@@ -2895,8 +2932,11 @@ client.on("interactionCreate", async (interaction) => {
         if (target.id === ticket.opener_id) {
           return interaction.reply({ content: "❌ Der Ticket-Ersteller kann nicht aus seinem eigenen Ticket entfernt werden.", ephemeral: true });
         }
-        await interaction.channel.members.remove(target.id).catch(() => null);
-        await interaction.reply({ content: `➖ <@${interaction.user.id}> hat ${target} aus dem Ticket entfernt.` });
+        await markTicketUserRemoved(interaction.channel.id, target.id, interaction.user.id);
+        await interaction.channel.members.remove(target.id).catch((err) => {
+          console.error(`❌ Konnte ${target.tag} nicht aus dem Ticket entfernen:`, err?.message || err);
+        });
+        await interaction.reply({ content: `➖ <@${interaction.user.id}> hat ${target} dauerhaft aus dem Ticket entfernt. Er wird nicht automatisch wieder hinzugefügt.` });
         return;
       }
 
