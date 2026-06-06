@@ -4,7 +4,7 @@
 // Update: Teamupdate-Rollen korrigiert, Probe-Mitarbeiter und Casino-Mitarbeiter ergänzt, Verwarnungen aus Teamupdate entfernt.
 // Update: Ticket-System mit öffentlichen Threads, Claim-System, Add/Remove/Rename/Close/Open Commands ergänzt.
 // Update: Private Ticket-Threads + stabilerer Member-Fetch ohne Query + Debug-Logs im Ticket-Debug-Channel.
-// Update: ticket-rename gefixt, Bürgerrollen für Slash-Commands gesperrt und nicht automatisch in Tickets eingeladen.
+// Update: ticket-rename Sofort-Antwort-Fix, Bürgerrollen für Slash-Commands gesperrt und nicht automatisch in Tickets eingeladen.
 // Wichtig: DISCORD_TOKEN, CLIENT_ID, GUILD_ID und DATABASE_URL in der .env eintragen.
 
 if (process.env.NODE_ENV !== "production") require("dotenv").config();
@@ -3049,30 +3049,48 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       if (interaction.commandName === "ticket-rename") {
-        const ticket = await ensureTicketThread(interaction);
-        if (!ticket) return;
-        if (!canUseTicketStaffCommands(interaction.member, ticket.category)) {
-          return interaction.reply({ content: "❌ Du darfst dieses Ticket nicht umbenennen.", ephemeral: true });
+        // Wichtig: sofort deferReply, damit Discord nicht mit "Anwendung reagiert nicht" abbricht,
+        // falls Datenbank oder Discord-Thread-Rename länger als 3 Sekunden brauchen.
+        await interaction.deferReply({ ephemeral: false });
+
+        if (!interaction.channel?.isThread?.()) {
+          await interaction.editReply({ content: "❌ Dieser Command kann nur in einem Ticket-Thread genutzt werden." });
+          return;
         }
 
-        const rawName = interaction.options.getString("name");
+        const ticket = await getTicketByThread(interaction.channel.id);
+        if (!ticket) {
+          await interaction.editReply({ content: "❌ Dieser Thread ist kein bekanntes Ticket." });
+          return;
+        }
+
+        if (!canUseTicketStaffCommands(interaction.member, ticket.category)) {
+          await interaction.editReply({ content: "❌ Du darfst dieses Ticket nicht umbenennen." });
+          return;
+        }
+
+        const rawName = interaction.options.getString("name", true);
         const newName = cleanTicketName(rawName).slice(0, 95);
 
-        await interaction.deferReply();
+        if (!newName || newName.length < 2) {
+          await interaction.editReply({ content: "❌ Bitte gib einen gültigen Ticketnamen an." });
+          return;
+        }
 
         try {
           await interaction.channel.setName(newName, `Ticket umbenannt von ${interaction.user.tag}`);
         } catch (err) {
           console.error("❌ Ticket konnte nicht umbenannt werden:", err);
-          return interaction.editReply({
+          await interaction.editReply({
             content: `❌ Das Ticket konnte nicht umbenannt werden. Bitte prüfe die Bot-Rechte. Fehler: \`${err?.code || "NO_CODE"}\``,
           });
+          return;
         }
 
         await query(
           `UPDATE ticket_records SET current_name = $2, updated_at = NOW() WHERE thread_id = $1`,
           [interaction.channel.id, newName]
-        );
+        ).catch((err) => console.error("❌ Ticket-Rename DB-Update fehlgeschlagen:", err));
 
         await interaction.editReply({ content: `✏️ <@${interaction.user.id}> hat das Ticket zu \`${newName}\` umbenannt.` });
         return;
