@@ -3,7 +3,7 @@
 // Update: 3-Stunden-Pflicht entfernt, Bungalow- & Essensstand-Buchungen ergänzt, Status gesetzt.
 // Update: Teamupdate-Rollen korrigiert, Probe-Mitarbeiter und Casino-Mitarbeiter ergänzt, Verwarnungen aus Teamupdate entfernt.
 // Update: Ticket-System mit öffentlichen Threads, Claim-System, Add/Remove/Rename/Close/Open Commands ergänzt.
-// Update: Ticket-Threads sind öffentlich im jeweiligen Ticket-Channel; Zugriff läuft über Channel-Rechte + @everyone Ping.
+// Update: Ticket-Threads sind privat; berechtigte Teammitglieder werden automatisch hinzugefügt + Debug-Logs im Manager-Chat.
 // Wichtig: DISCORD_TOKEN, CLIENT_ID, GUILD_ID und DATABASE_URL in der .env eintragen.
 
 if (process.env.NODE_ENV !== "production") require("dotenv").config();
@@ -95,6 +95,7 @@ const ACTIVE_STANDS_CHANNEL_ID = "1512314177396543581";
 const PERSONAL_FILES_CHANNEL_ID = "1512314182299816049";
 const STATISTICS_WEEKLY_CHANNEL_ID = "1512314182299816050";
 const MANAGER_CHAT_CHANNEL_ID = "1512314181259366547";
+const TICKET_DEBUG_CHANNEL_ID = "1512779121170714695";
 
 const BOOKING_REQUEST_CHANNEL_ID = "1512409329771221075";
 const BOOKING_CONFIRMED_CHANNEL_ID = "1512409661029224488";
@@ -940,38 +941,77 @@ async function ensureTicketThread(interaction) {
   return ticket;
 }
 
+async function sendTicketDebugLog(message) {
+  console.log(message);
+
+  const channel = await client.channels.fetch(TICKET_DEBUG_CHANNEL_ID).catch(() => null);
+  if (!channel) return;
+
+  await channel.send({ content: message.slice(0, 1900) }).catch(() => null);
+}
+
 async function addAllowedStaffToThread(thread, categoryKey) {
   const guild = await client.guilds.fetch(GUILD_ID);
 
-  // Wichtig: Damit wirklich alle berechtigten User direkt im Thread sind,
-  // werden alle Servermitglieder geladen und User mit den festgelegten Rollen einzeln hinzugefügt.
-  const members = await guild.members.fetch({ force: true }).catch((err) => {
+  // Der Bot selbst tritt dem Thread bei, bevor Mitglieder hinzugefügt werden.
+  // Das hilft besonders bei privaten Threads.
+  await thread.join().catch((err) => {
+    console.error("⚠️ Bot konnte dem Ticket-Thread nicht beitreten:", err?.message || err);
+  });
+
+  const allowedRoles = TICKET_AUTO_ADD_ROLE_IDS;
+
+  const members = await guild.members.fetch({ force: true, cache: true }).catch((err) => {
     console.error("❌ Mitglieder konnten für Ticket-Zugriff nicht geladen werden:", err);
     return null;
   });
 
-  if (!members) return { added: 0, failed: 0 };
+  if (!members) {
+    await sendTicketDebugLog(
+      `❌ **Ticket-Debug** (${categoryKey})\n` +
+      `Mitglieder konnten nicht geladen werden. Prüfe im Developer Portal den **SERVER MEMBERS INTENT** und die Bot-Rechte.`
+    );
+    return { added: 0, failed: 0, found: 0 };
+  }
 
-  const allowedRoles = TICKET_AUTO_ADD_ROLE_IDS;
-  const added = new Set();
-  let failed = 0;
+  const roleCounts = allowedRoles.map((roleId) => {
+    const role = guild.roles.cache.get(roleId);
+    const count = members.filter((member) => !member.user.bot && member.roles.cache.has(roleId)).size;
+    return `${role ? role.name : roleId}: ${count}`;
+  });
 
-  for (const [, member] of members) {
-    if (member.user.bot) continue;
-    if (added.has(member.id)) continue;
-    if (!memberHasAnyRole(member, allowedRoles)) continue;
+  const candidates = members.filter((member) => {
+    if (member.user.bot) return false;
+    return memberHasAnyRole(member, allowedRoles);
+  });
 
+  const added = [];
+  const failed = [];
+
+  for (const [, member] of candidates) {
     try {
-      await thread.members.add(member.id);
-      added.add(member.id);
+      await thread.members.add(member.id, "Automatischer Ticket-Teamzugriff");
+      added.push(`${member.user.tag} (${member.id})`);
     } catch (err) {
-      failed++;
-      console.error(`❌ Konnte ${member.user.tag} nicht zum Ticket-Thread hinzufügen:`, err?.message || err);
+      failed.push(`${member.user.tag} (${member.id}) → ${err?.code || "NO_CODE"}: ${err?.message || err}`);
+      console.error(`❌ Konnte ${member.user.tag} (${member.id}) nicht zum Ticket-Thread hinzufügen:`, err);
     }
   }
 
-  console.log(`🎫 Ticket-Zugriff: ${added.size} Teammitglieder automatisch zum Thread hinzugefügt, ${failed} fehlgeschlagen (${categoryKey}).`);
-  return { added: added.size, failed };
+  const debugText =
+    `🎫 **Ticket-Debug** (${categoryKey})\n` +
+    `Thread: ${thread.name} (${thread.id})\n` +
+    `Gefundene Teammitglieder: **${candidates.size}**\n` +
+    `Erfolgreich hinzugefügt: **${added.length}**\n` +
+    `Fehlgeschlagen: **${failed.length}**\n\n` +
+    `**Rollen-Check:**\n${roleCounts.slice(0, 20).join("\n")}\n\n` +
+    (failed.length
+      ? `**Fehler:**\n${failed.slice(0, 10).join("\n")}`
+      : `✅ Keine Fehler beim Hinzufügen.`);
+
+  await sendTicketDebugLog(debugText);
+
+  return { added: added.length, failed: failed.length, found: candidates.size };
 }
 
 async function createTicketFromButton(interaction, categoryKey) {
@@ -999,6 +1039,8 @@ async function createTicketFromButton(interaction, categoryKey) {
   });
 
   const staffAddResult = await addAllowedStaffToThread(thread, categoryKey);
+
+  console.log(`🎫 Ticket erstellt: ${categoryKey} | Gefunden: ${staffAddResult.found || 0} | Hinzugefügt: ${staffAddResult.added || 0} | Fehler: ${staffAddResult.failed || 0}`);
 
   const insert = await query(
     `
