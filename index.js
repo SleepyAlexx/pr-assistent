@@ -553,6 +553,11 @@ async function registerCommands() {
       .setName("ticket-close")
       .setDescription("Startet eine Schließungsanfrage für das aktuelle Ticket."),
 
+    // Alias ohne Bindestrich, falls man /ticketclose eingibt
+    new SlashCommandBuilder()
+      .setName("ticketclose")
+      .setDescription("Startet eine Schließungsanfrage für das aktuelle Ticket."),
+
     new SlashCommandBuilder()
       .setName("ticket-open")
       .setDescription("Öffnet ein archiviertes/geschlossenes Ticket wieder.")
@@ -1429,73 +1434,106 @@ async function claimTicket(interaction) {
 }
 
 async function requestTicketClose(interaction) {
-  const ticket = await ensureTicketThread(interaction);
-  if (!ticket) return;
-
-  if (!canUseTicketStaffCommands(interaction.member, ticket.category)) {
-    return interaction.reply({ content: "❌ Du darfst dieses Ticket nicht schließen.", ephemeral: true });
-  }
-
-  await interaction.deferReply({ ephemeral: true });
-
-  const thread = getSafeInteractionChannel(interaction);
-  if (!thread) {
-    return interaction.editReply({ content: "❌ Dieser Command kann nur direkt im Ticket-Thread genutzt werden." });
-  }
-
-  if (ticket.status === "closing_requested") {
-    return interaction.editReply({ content: "⚠️ Für dieses Ticket läuft bereits eine Schließungsanfrage." });
-  }
-
-  const deadline = new Date(Date.now() + TICKET_CLOSE_AFTER_MS);
-  const closingName = getClosingTicketName(ticket);
+  // Sofort bestätigen, damit Discord nicht dauerhaft lädt.
+  await interaction.deferReply({ ephemeral: true }).catch(() => null);
 
   try {
-    await thread.setName(closingName, `Schließungsanfrage von ${interaction.user.tag}`);
-  } catch (err) {
-    console.error("❌ Ticket konnte für Schließung nicht umbenannt werden:", err);
-  }
+    if (!interaction.channel?.isThread?.()) {
+      return interaction.editReply({
+        content: "❌ Dieser Command kann nur direkt in einem Ticket-Thread genutzt werden.",
+      }).catch(() => null);
+    }
 
-  const embed = new EmbedBuilder()
-    .setColor(0xe67e22)
-    .setTitle("🔒 ・SCHLIESSUNGSANFRAGE")
-    .setDescription(
-      `<@${interaction.user.id}> möchte dieses Ticket schließen.\n\n` +
-        `Du hast nun **2 Tage Zeit**, die Schließung zu bestätigen oder abzulehnen.\n\n` +
-        "━━━━━━━━━━━━━━━━━━━━\n" +
-        "⏳ Frist: läuft in **2 Tagen** ab"
-    )
-    .setFooter({ text: "Pearls • Ticket-Schließung" })
-    .setTimestamp();
+    const thread = interaction.channel;
 
-  let msg = null;
-  try {
-    msg = await thread.send({
-      content: `<@${ticket.opener_id}>`,
-      embeds: [embed],
-      components: [ticketCloseButtons(thread.id)],
-      allowedMentions: { users: [ticket.opener_id] },
+    const ticket = await getOrRecoverTicketFromThread(thread);
+    if (!ticket) {
+      return interaction.editReply({
+        content:
+          "❌ Dieser Thread ist kein bekanntes Ticket. " +
+          "Bitte nutze den Command nur in Tickets, die über das Ticketpanel erstellt wurden.",
+      }).catch(() => null);
+    }
+
+    if (!canUseTicketStaffCommands(interaction.member, ticket.category)) {
+      return interaction.editReply({
+        content: "❌ Du darfst dieses Ticket nicht schließen.",
+      }).catch(() => null);
+    }
+
+    if (ticket.status === "closing_requested") {
+      return interaction.editReply({
+        content: "⚠️ Für dieses Ticket läuft bereits eine Schließungsanfrage.",
+      }).catch(() => null);
+    }
+
+    const deadline = new Date(Date.now() + TICKET_CLOSE_AFTER_MS);
+    const closingName = getClosingTicketName(ticket);
+
+    try {
+      await thread.setName(closingName, `Schließungsanfrage von ${interaction.user.tag}`);
+    } catch (err) {
+      console.error("❌ Ticket konnte für Schließung nicht umbenannt werden:", err);
+    }
+
+    const embed = new EmbedBuilder()
+      .setColor(0xe67e22)
+      .setTitle("🔒 ・SCHLIESSUNGSANFRAGE")
+      .setDescription(
+        `<@${interaction.user.id}> möchte dieses Ticket schließen.\n\n` +
+          `Du hast nun **2 Tage Zeit**, die Schließung zu bestätigen oder abzulehnen.\n\n` +
+          "━━━━━━━━━━━━━━━━━━━━\n" +
+          "⏳ Frist: läuft in **2 Tagen** ab"
+      )
+      .setFooter({ text: "Pearls • Ticket-Schließung" })
+      .setTimestamp();
+
+    let msg = null;
+
+    try {
+      msg = await thread.send({
+        content: `<@${ticket.opener_id}>`,
+        embeds: [embed],
+        components: [ticketCloseButtons(thread.id)],
+        allowedMentions: { users: [ticket.opener_id] },
+      });
+    } catch (err) {
+      console.error("❌ Schließungsnachricht konnte nicht gesendet werden:", err);
+
+      return interaction.editReply({
+        content:
+          "❌ Die Schließungsanfrage konnte nicht gesendet werden. " +
+          "Prüfe, ob der Bot im Thread schreiben darf.",
+      }).catch(() => null);
+    }
+
+    await query(
+      `
+      UPDATE ticket_records
+      SET status = 'closing_requested',
+          close_requested_by = $2,
+          close_requested_at = NOW(),
+          close_deadline_at = $3,
+          close_message_id = $4,
+          updated_at = NOW()
+      WHERE thread_id = $1;
+      `,
+      [thread.id, interaction.user.id, deadline, msg.id]
+    ).catch((err) => {
+      console.error("❌ Ticket-Close DB-Update fehlgeschlagen:", err);
     });
+
+    return interaction.editReply({
+      content: "✅ Schließungsanfrage wurde gestellt.",
+    }).catch(() => null);
   } catch (err) {
-    console.error("❌ Schließungsnachricht konnte nicht gesendet werden:", err);
-    return interaction.editReply({ content: "❌ Die Schließungsanfrage konnte nicht gesendet werden. Prüfe Bot-Rechte im Thread." });
+    console.error("❌ Fehler bei /ticket-close:", err);
+
+    return interaction.editReply({
+      content:
+        "❌ Beim Schließen des Tickets ist ein Fehler passiert. Schau bitte in die Railway Logs.",
+    }).catch(() => null);
   }
-
-  await query(
-    `
-    UPDATE ticket_records
-    SET status = 'closing_requested',
-        close_requested_by = $2,
-        close_requested_at = NOW(),
-        close_deadline_at = $3,
-        close_message_id = $4,
-        updated_at = NOW()
-    WHERE thread_id = $1;
-    `,
-    [thread.id, interaction.user.id, deadline, msg.id]
-  ).catch((err) => console.error("❌ Ticket-Close DB-Update fehlgeschlagen:", err));
-
-  return interaction.editReply({ content: "✅ Schließungsanfrage wurde gestellt." });
 }
 
 async function archiveTicketForDeletion(thread, ticket, actorId, reasonText) {
@@ -3379,7 +3417,7 @@ client.on("interactionCreate", async (interaction) => {
         return claimTicket(interaction);
       }
 
-      if (interaction.commandName === "ticket-close") {
+      if (interaction.commandName === "ticket-close" || interaction.commandName === "ticketclose") {
         return requestTicketClose(interaction);
       }
 
