@@ -402,6 +402,18 @@ async function initDatabase() {
     );
   `);
 
+  // Neue stabile Verknüpfung über Namen, weil die Business-ID im Fremdsystem wechseln kann.
+  await query(`
+    CREATE TABLE IF NOT EXISTS business_name_links (
+      name_key TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      linked_by TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
   await query(`
     CREATE TABLE IF NOT EXISTS warning_records (
       id SERIAL PRIMARY KEY,
@@ -652,17 +664,11 @@ async function registerCommands() {
 
     new SlashCommandBuilder()
       .setName("business-link")
-      .setDescription("Verknüpft eine Business-ID mit einem Discord-User.")
+      .setDescription("Verknüpft einen Business-Namen mit einem Discord-User.")
       .addUserOption((option) =>
         option
           .setName("user")
           .setDescription("Discord-User auswählen")
-          .setRequired(true)
-      )
-      .addIntegerOption((option) =>
-        option
-          .setName("business_id")
-          .setDescription("Business-ID aus dem Zeitstempel-Log")
           .setRequired(true)
       )
       .addStringOption((option) =>
@@ -674,15 +680,15 @@ async function registerCommands() {
 
     new SlashCommandBuilder()
       .setName("business-links")
-      .setDescription("Zeigt alle Business-ID-Verknüpfungen an."),
+      .setDescription("Zeigt alle Business-Namen-Verknüpfungen an."),
 
     new SlashCommandBuilder()
       .setName("business-unlink")
-      .setDescription("Löscht eine Business-ID-Verknüpfung.")
-      .addIntegerOption((option) =>
+      .setDescription("Löscht eine Business-Namen-Verknüpfung.")
+      .addStringOption((option) =>
         option
-          .setName("business_id")
-          .setDescription("Business-ID, die entfernt werden soll")
+          .setName("name")
+          .setDescription("Name aus dem Business-System, der entfernt werden soll")
           .setRequired(true)
       ),
 
@@ -3746,35 +3752,55 @@ function timeUserSelect(customId, placeholder = "Mitarbeiter auswählen") {
 
 
 // =====================
-// BUSINESS-ID VERKNÜPFUNGEN
+// BUSINESS-NAMEN VERKNÜPFUNGEN
 // =====================
-async function upsertBusinessUserLink(businessId, userId, name, linkedBy) {
-  const cleanBusinessId = String(businessId).trim();
-  const cleanName = String(name || "").trim();
+function normalizeBusinessName(name) {
+  return String(name || "")
+    .trim()
+    .toLowerCase()
+    .replace(/ä/g, "ae")
+    .replace(/ö/g, "oe")
+    .replace(/ü/g, "ue")
+    .replace(/ß/g, "ss")
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+async function upsertBusinessUserLink(userId, name, linkedBy) {
+  const cleanName = String(name || "").trim().replace(/\s+/g, " ");
+  const nameKey = normalizeBusinessName(cleanName);
+
+  if (!nameKey || nameKey.length < 2) {
+    throw new Error("Ungültiger Business-Name");
+  }
 
   await ensureEmployee(userId).catch(() => null);
 
   const res = await query(
     `
-    INSERT INTO business_user_links (business_id, user_id, name, linked_by)
+    INSERT INTO business_name_links (name_key, user_id, name, linked_by)
     VALUES ($1, $2, $3, $4)
-    ON CONFLICT (business_id)
+    ON CONFLICT (name_key)
     DO UPDATE SET user_id = EXCLUDED.user_id,
                   name = EXCLUDED.name,
                   linked_by = EXCLUDED.linked_by,
                   updated_at = NOW()
     RETURNING *;
     `,
-    [cleanBusinessId, userId, cleanName, linkedBy]
+    [nameKey, userId, cleanName, linkedBy]
   );
 
   return res.rows[0];
 }
 
-async function getBusinessUserLink(businessId) {
+async function getBusinessUserLink(name) {
+  const nameKey = normalizeBusinessName(name);
+  if (!nameKey) return null;
+
   const res = await query(
-    `SELECT * FROM business_user_links WHERE business_id = $1 LIMIT 1`,
-    [String(businessId).trim()]
+    `SELECT * FROM business_name_links WHERE name_key = $1 LIMIT 1`,
+    [nameKey]
   ).catch(() => ({ rows: [] }));
 
   return res.rows[0] || null;
@@ -3784,7 +3810,7 @@ async function listBusinessUserLinks() {
   const res = await query(
     `
     SELECT *
-    FROM business_user_links
+    FROM business_name_links
     ORDER BY updated_at DESC
     LIMIT 50;
     `
@@ -3793,10 +3819,13 @@ async function listBusinessUserLinks() {
   return res.rows;
 }
 
-async function deleteBusinessUserLink(businessId) {
+async function deleteBusinessUserLink(name) {
+  const nameKey = normalizeBusinessName(name);
+  if (!nameKey) return null;
+
   const res = await query(
-    `DELETE FROM business_user_links WHERE business_id = $1 RETURNING *`,
-    [String(businessId).trim()]
+    `DELETE FROM business_name_links WHERE name_key = $1 RETURNING *`,
+    [nameKey]
   ).catch(() => ({ rows: [] }));
 
   return res.rows[0] || null;
@@ -3884,7 +3913,7 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
-    const linkedUser = await getBusinessUserLink(parsed.businessId);
+    const linkedUser = await getBusinessUserLink(parsed.employeeName);
 
     console.log("✅ Business-Zeitlog erkannt:", {
       name: parsed.employeeName,
@@ -3896,7 +3925,7 @@ client.on("messageCreate", async (message) => {
     });
 
     if (!linkedUser) {
-      console.log(`ℹ️ Business-ID ${parsed.businessId} ist noch nicht verknüpft. Nutze /business-link user:@User business_id:${parsed.businessId} name:${parsed.employeeName}`);
+      console.log(`ℹ️ Business-Name "${parsed.employeeName}" ist noch nicht verknüpft. Nutze /business-link user:@User name:${parsed.employeeName}`);
       return;
     }
 
@@ -3925,7 +3954,7 @@ async function startBotOnce() {
 
   try {
     if (client.user) {
-      client.user.setActivity("Made by Kquwi✞");
+      client.user.setActivity("Made by Kquwi♱");
     }
 
     await initDatabase();
@@ -4439,21 +4468,20 @@ client.on("interactionCreate", async (interaction) => {
         await interaction.deferReply({ ephemeral: true }).catch(() => null);
 
         if (!canManagePersonal(interaction.member)) {
-          await interaction.editReply({ content: "❌ Du darfst Business-IDs nicht verknüpfen." }).catch(() => null);
+          await interaction.editReply({ content: "❌ Du darfst Business-Namen nicht verknüpfen." }).catch(() => null);
           return;
         }
 
         const targetUser = interaction.options.getUser("user", true);
-        const businessId = interaction.options.getInteger("business_id", true);
-        const name = interaction.options.getString("name", true).trim();
+        const name = interaction.options.getString("name", true).trim().replace(/\s+/g, " ");
 
         if (!name || name.length < 2) {
-          await interaction.editReply({ content: "❌ Bitte gib einen gültigen Namen an." }).catch(() => null);
+          await interaction.editReply({ content: "❌ Bitte gib einen gültigen Namen an, genau wie er im Zeitstempel-Log steht." }).catch(() => null);
           return;
         }
 
-        const saved = await upsertBusinessUserLink(businessId, targetUser.id, name, interaction.user.id).catch((err) => {
-          console.error("❌ Business-Link konnte nicht gespeichert werden:", err);
+        const saved = await upsertBusinessUserLink(targetUser.id, name, interaction.user.id).catch((err) => {
+          console.error("❌ Business-Name-Link konnte nicht gespeichert werden:", err);
           return null;
         });
 
@@ -4464,11 +4492,10 @@ client.on("interactionCreate", async (interaction) => {
 
         await interaction.editReply({
           content:
-            "✅ **Business-ID verknüpft**\n\n" +
-            `Business-ID: **${saved.business_id}**\n` +
+            "✅ **Business-Name verknüpft**\n\n" +
             `Name: **${saved.name}**\n` +
             `Discord-User: <@${saved.user_id}>\n\n` +
-            "Beim nächsten Zeitlog erkennt der Scanner jetzt den passenden Discord-User.",
+            "Die wechselnde Business-ID ist jetzt egal. Der Scanner erkennt den User über den Namen.",
         }).catch(() => null);
         return;
       }
@@ -4484,17 +4511,17 @@ client.on("interactionCreate", async (interaction) => {
         const links = await listBusinessUserLinks();
 
         if (!links.length) {
-          await interaction.editReply({ content: "📭 Es gibt noch keine Business-ID-Verknüpfungen. Nutze `/business-link`." }).catch(() => null);
+          await interaction.editReply({ content: "📭 Es gibt noch keine Business-Namen-Verknüpfungen. Nutze `/business-link`." }).catch(() => null);
           return;
         }
 
         const lines = links.map((link, index) => {
-          return `${index + 1}. **${link.business_id}** → <@${link.user_id}> | ${link.name}`;
+          return `${index + 1}. **${link.name}** → <@${link.user_id}>`;
         });
 
         await interaction.editReply({
           content:
-            "📋 **Business-ID-Verknüpfungen**\n\n" +
+            "📋 **Business-Namen-Verknüpfungen**\n\n" +
             lines.join("\n")
         }).catch(() => null);
         return;
@@ -4508,20 +4535,19 @@ client.on("interactionCreate", async (interaction) => {
           return;
         }
 
-        const businessId = interaction.options.getInteger("business_id", true);
-        const deleted = await deleteBusinessUserLink(businessId);
+        const name = interaction.options.getString("name", true).trim().replace(/\s+/g, " ");
+        const deleted = await deleteBusinessUserLink(name);
 
         if (!deleted) {
-          await interaction.editReply({ content: `⚠️ Für Business-ID **${businessId}** wurde keine Verknüpfung gefunden.` }).catch(() => null);
+          await interaction.editReply({ content: `⚠️ Für den Business-Namen **${name}** wurde keine Verknüpfung gefunden.` }).catch(() => null);
           return;
         }
 
         await interaction.editReply({
           content:
             "✅ **Business-Verknüpfung gelöscht**\n\n" +
-            `Business-ID: **${deleted.business_id}**\n` +
-            `Vorheriger User: <@${deleted.user_id}>\n` +
-            `Name: **${deleted.name}**`,
+            `Name: **${deleted.name}**\n` +
+            `Vorheriger User: <@${deleted.user_id}>`,
         }).catch(() => null);
         return;
       }
