@@ -1594,8 +1594,57 @@ async function ticketTimeout(promise, ms, label) {
   }
 }
 
+function safeThreadRename(thread, newName, reason, label = "Thread umbenennen") {
+  if (!thread?.setName || !newName) return;
+
+  setTimeout(() => {
+    thread.setName(newName, reason)
+      .then(() => console.log(`✅ ${label}: ${newName}`))
+      .catch((err) => console.error(`⚠️ ${label} fehlgeschlagen:`, err?.message || err));
+  }, 250);
+}
+
+function safeThreadUnarchiveUnlock(thread, reason = "Ticket freigeben") {
+  if (!thread?.isThread?.()) return;
+
+  setTimeout(async () => {
+    await thread.setArchived(false, reason).catch((err) => {
+      // Nicht kritisch, wenn der Thread sowieso offen ist.
+      console.error("⚠️ Thread entarchivieren fehlgeschlagen:", err?.message || err);
+    });
+
+    await thread.setLocked(false, reason).catch((err) => {
+      // Nicht kritisch, wenn der Thread sowieso nicht gelockt ist.
+      console.error("⚠️ Thread entsperren fehlgeschlagen:", err?.message || err);
+    });
+  }, 250);
+}
+
+function scheduleTicketArchiveFinalization(thread, closedName) {
+  if (!thread?.isThread?.()) return;
+
+  setTimeout(async () => {
+    console.log(`🔒 Ticket-Archivierung im Hintergrund gestartet: ${thread.id}`);
+
+    await thread.setName(closedName, "Ticket geschlossen").catch((err) => {
+      console.error("⚠️ Ticket konnte beim Schließen nicht umbenannt werden:", err?.message || err);
+    });
+
+    await thread.setLocked(true, "Ticket geschlossen").catch((err) => {
+      console.error("⚠️ Ticket konnte nicht gelockt werden:", err?.message || err);
+    });
+
+    await thread.setArchived(true, "Ticket geschlossen").catch((err) => {
+      console.error("⚠️ Ticket konnte nicht archiviert werden:", err?.message || err);
+    });
+
+    console.log(`✅ Ticket-Archivierung im Hintergrund beendet: ${thread.id}`);
+  }, 750);
+}
+
+
 async function requestTicketClose(interaction) {
-  // Wichtig: Sofort antworten, damit Discord nicht dauerhaft "denkt nach..." zeigt.
+  // Sofort antworten: Slash-Commands dürfen niemals durch Rename/Archivierung hängen.
   await interaction.deferReply({ ephemeral: true }).catch(() => null);
   await interaction.editReply({ content: "⏳ Schließungsanfrage wird vorbereitet..." }).catch(() => null);
 
@@ -1610,42 +1659,55 @@ async function requestTicketClose(interaction) {
     console.log(`🔒 Ticket-Close gestartet: ${thread.name} (${thread.id}) von ${interaction.user.tag}`);
 
     const ticket = await ticketTimeout(getOrRecoverTicketFromThread(thread), 7000, "Ticket-Daten laden").catch((err) => {
-      console.error("❌ Ticket-Daten konnten bei /ticket-close nicht geladen werden:", err);
+      console.error("❌ Ticket-Daten konnten bei /ticket-close nicht geladen werden:", err?.message || err);
       return null;
     });
 
     if (!ticket) {
       return interaction.editReply({
-        content:
-          "❌ Dieses Ticket konnte nicht aus der Datenbank geladen werden. " +
-          "Bitte prüfe Railway/PostgreSQL und versuche es erneut.",
+        content: "❌ Dieses Ticket konnte nicht aus der Datenbank geladen werden. Bitte prüfe Railway/PostgreSQL.",
       }).catch(() => null);
     }
 
     if (!canUseTicketStaffCommands(interaction.member, ticket.category)) {
-      return interaction.editReply({
-        content: "❌ Du darfst dieses Ticket nicht schließen.",
-      }).catch(() => null);
+      return interaction.editReply({ content: "❌ Du darfst dieses Ticket nicht schließen." }).catch(() => null);
     }
 
     if (ticket.status === "closing_requested") {
-      return interaction.editReply({
-        content: "⚠️ Für dieses Ticket läuft bereits eine Schließungsanfrage.",
-      }).catch(() => null);
+      return interaction.editReply({ content: "⚠️ Für dieses Ticket läuft bereits eine Schließungsanfrage." }).catch(() => null);
     }
 
     const deadline = new Date(Date.now() + TICKET_CLOSE_AFTER_MS);
     const closingName = getClosingTicketName(ticket);
 
-    await interaction.editReply({ content: "⏳ Ticket wird auf Schließung gesetzt..." }).catch(() => null);
-
-    await ticketTimeout(
-      thread.setName(closingName, `Schließungsanfrage von ${interaction.user.tag}`),
+    // Status zuerst setzen. Die Thread-Umbenennung ist nur Optik und darf nie den Command blockieren.
+    const dbStart = await ticketTimeout(
+      query(
+        `
+        UPDATE ticket_records
+        SET status = 'closing_requested',
+            close_requested_by = $2,
+            close_requested_at = NOW(),
+            close_deadline_at = $3,
+            close_message_id = NULL,
+            updated_at = NOW()
+        WHERE thread_id = $1;
+        `,
+        [thread.id, interaction.user.id, deadline]
+      ),
       7000,
-      "Threadname ändern"
+      "Ticket-Close DB-Vorbereitung"
     ).catch((err) => {
-      console.error("❌ Ticket konnte für Schließung nicht umbenannt werden:", err);
+      console.error("❌ Ticket-Close DB-Vorbereitung fehlgeschlagen:", err?.message || err);
+      return null;
     });
+
+    if (!dbStart) {
+      return interaction.editReply({ content: "❌ Die Schließungsanfrage konnte nicht in der Datenbank gespeichert werden." }).catch(() => null);
+    }
+
+    // Nicht awaiten: Discord/Railway kann beim Umbenennen hängen oder Rate-Limit haben.
+    safeThreadRename(thread, closingName, `Schließungsanfrage von ${interaction.user.tag}`, "Ticket für Schließung umbenennen");
 
     const embed = new EmbedBuilder()
       .setColor(0xe67e22)
@@ -1659,11 +1721,7 @@ async function requestTicketClose(interaction) {
       .setFooter({ text: "Pearls • Ticket-Schließung" })
       .setTimestamp();
 
-    let msg = null;
-
-    await interaction.editReply({ content: "⏳ Schließungsnachricht wird gesendet..." }).catch(() => null);
-
-    msg = await ticketTimeout(
+    const msg = await ticketTimeout(
       thread.send({
         content: `<@${ticket.opener_id}>`,
         embeds: [embed],
@@ -1673,111 +1731,97 @@ async function requestTicketClose(interaction) {
       10000,
       "Schließungsnachricht senden"
     ).catch((err) => {
-      console.error("❌ Schließungsnachricht konnte nicht gesendet werden:", err);
+      console.error("❌ Schließungsnachricht konnte nicht gesendet werden:", err?.message || err);
       return null;
     });
 
     if (!msg) {
+      // Rollback, damit nicht dauerhaft closing_requested stehen bleibt, obwohl keine Buttons existieren.
+      await query(
+        `
+        UPDATE ticket_records
+        SET status = 'open',
+            close_requested_by = NULL,
+            close_requested_at = NULL,
+            close_deadline_at = NULL,
+            close_message_id = NULL,
+            updated_at = NOW()
+        WHERE thread_id = $1;
+        `,
+        [thread.id]
+      ).catch((err) => console.error("❌ Ticket-Close Rollback fehlgeschlagen:", err?.message || err));
+
       return interaction.editReply({
-        content:
-          "❌ Die Schließungsanfrage konnte nicht gesendet werden. " +
-          "Prüfe, ob der Bot im Thread schreiben darf.",
+        content: "❌ Die Schließungsanfrage konnte nicht gesendet werden. Der Ticketstatus wurde wieder geöffnet.",
       }).catch(() => null);
     }
 
     await ticketTimeout(
-      query(
-        `
-        UPDATE ticket_records
-        SET status = 'closing_requested',
-            close_requested_by = $2,
-            close_requested_at = NOW(),
-            close_deadline_at = $3,
-            close_message_id = $4,
-            updated_at = NOW()
-        WHERE thread_id = $1;
-        `,
-        [thread.id, interaction.user.id, deadline, msg.id]
-      ),
-      7000,
-      "Ticket-Close DB-Update"
-    ).catch((err) => {
-      console.error("❌ Ticket-Close DB-Update fehlgeschlagen:", err);
-    });
+      query(`UPDATE ticket_records SET close_message_id = $2, updated_at = NOW() WHERE thread_id = $1`, [thread.id, msg.id]),
+      5000,
+      "Close-Message-ID speichern"
+    ).catch((err) => console.error("⚠️ Close-Message-ID konnte nicht gespeichert werden:", err?.message || err));
 
     console.log(`✅ Ticket-Close erfolgreich gestartet: ${thread.id}`);
-
-    return interaction.editReply({
-      content: "✅ Schließungsanfrage wurde gestellt.",
-    }).catch(() => null);
+    return interaction.editReply({ content: "✅ Schließungsanfrage wurde gestellt." }).catch(() => null);
   } catch (err) {
-    console.error("❌ Fehler bei /ticket-close:", err);
-
+    console.error("❌ Fehler bei /ticket-close:", err?.message || err);
     return interaction.editReply({
-      content:
-        "❌ Beim Schließen des Tickets ist ein Fehler passiert. Schau bitte in die Railway Logs.",
+      content: "❌ Beim Schließen des Tickets ist ein Fehler passiert. Schau bitte in die Railway Logs.",
     }).catch(() => null);
   }
 }
 
 async function archiveTicketForDeletion(thread, ticket, actorId, reasonText) {
+  // Diese Funktion darf keine Interactions blockieren. Kritisch ist nur: DB auf closed setzen.
+  // Rename/Lock/Archive laufen danach im Hintergrund, weil genau diese Discord-Aktionen bei dir Timeouts erzeugt haben.
   const deleteAt = new Date(Date.now() + TICKET_DELETE_AFTER_CLOSE_MS);
   const restoreName = getRestoreTicketName(ticket);
   const closedName = `closed-${restoreName}`.slice(0, 95);
 
-  await query(
-    `
-    UPDATE ticket_records
-    SET status = 'closed',
-        current_name = $2,
-        close_requested_by = NULL,
-        close_requested_at = NULL,
-        close_deadline_at = NULL,
-        close_message_id = NULL,
-        delete_after_at = $3,
-        updated_at = NOW()
-    WHERE thread_id = $1;
-    `,
-    [ticket.thread_id, restoreName, deleteAt]
-  ).catch((err) => console.error("❌ Ticket-Archiv DB-Update fehlgeschlagen:", err));
+  await ticketTimeout(
+    query(
+      `
+      UPDATE ticket_records
+      SET status = 'closed',
+          current_name = $2,
+          close_requested_by = NULL,
+          close_requested_at = NULL,
+          close_deadline_at = NULL,
+          close_message_id = NULL,
+          delete_after_at = $3,
+          updated_at = NOW()
+      WHERE thread_id = $1;
+      `,
+      [ticket.thread_id, restoreName, deleteAt]
+    ),
+    7000,
+    "Ticket-Archiv DB-Update"
+  ).catch((err) => console.error("❌ Ticket-Archiv DB-Update fehlgeschlagen:", err?.message || err));
 
-  await thread.send({
-    content:
-      `✅ ・TICKET GESCHLOSSEN\n\n` +
-      `${actorId ? `<@${actorId}> hat die Schließung bestätigt.\n` : "Die Schließungsfrist ist abgelaufen.\n"}` +
-      `${reasonText || "Das Ticket wurde geschlossen."}\n\n` +
-      `Der Thread wird jetzt **gelockt und archiviert**.\n` +
-      `Er kann innerhalb von **2 Tagen** mit \`/ticket-open thread_id:${ticket.thread_id}\` wieder geöffnet werden.\n` +
-      `Danach wird er automatisch gelöscht.`,
-    allowedMentions: { users: actorId ? [actorId] : [] },
-  }).catch(() => null);
+  await ticketTimeout(
+    thread.send({
+      content:
+        `✅ ・TICKET GESCHLOSSEN\n\n` +
+        `${actorId ? `<@${actorId}> hat die Schließung bestätigt.\n` : "Die Schließungsfrist ist abgelaufen.\n"}` +
+        `${reasonText || "Das Ticket wurde geschlossen."}\n\n` +
+        `Der Thread wird jetzt **gelockt und archiviert**.\n` +
+        `Er kann innerhalb von **2 Tagen** mit \`/ticket-open thread_id:${ticket.thread_id}\` wieder geöffnet werden.\n` +
+        `Danach wird er automatisch gelöscht.`,
+      allowedMentions: { users: actorId ? [actorId] : [] },
+    }),
+    8000,
+    "Ticket-Geschlossen-Nachricht senden"
+  ).catch((err) => console.error("⚠️ Ticket-Geschlossen-Nachricht konnte nicht gesendet werden:", err?.message || err));
 
-  await thread.setName(closedName, "Ticket geschlossen").catch((err) => {
-    console.error("❌ Ticket konnte beim Schließen nicht umbenannt werden:", err?.message || err);
-  });
-
-  await thread.setLocked(true, "Ticket geschlossen").catch((err) => {
-    console.error("❌ Ticket konnte nicht gelockt werden:", err?.message || err);
-  });
-
-  await thread.setArchived(true, "Ticket geschlossen").catch((err) => {
-    console.error("❌ Ticket konnte nicht archiviert werden:", err?.message || err);
-  });
+  // Hintergrund-Finalisierung: nicht awaiten, damit Button/Command nicht hängen bleibt.
+  scheduleTicketArchiveFinalization(thread, closedName);
 }
 
 async function handleTicketCloseDecision(interaction, closeToken, decision) {
-  // FINAL ROBUST FIX:
-  // Buttons müssen sofort eine Antwort bekommen, sonst zeigt Discord dauerhaft "lädt".
-  // Alle Discord-Aktionen danach laufen mit Timeout und eigener Fehlerbehandlung,
-  // damit ein hängender setName/send/edit Schritt den kompletten Button nicht blockiert.
-
   async function runStep(label, promiseFactory, timeoutMs = 5000) {
     try {
-      const timeout = new Promise((_, reject) => {
-        setTimeout(() => reject(new Error(`${label} Timeout nach ${timeoutMs}ms`)), timeoutMs);
-      });
-
-      const result = await Promise.race([promiseFactory(), timeout]);
+      const result = await ticketTimeout(Promise.resolve().then(promiseFactory), timeoutMs, label);
       console.log(`✅ ${label}`);
       return { ok: true, result };
     } catch (err) {
@@ -1789,11 +1833,8 @@ async function handleTicketCloseDecision(interaction, closeToken, decision) {
   async function safePrivate(content) {
     try {
       if (interaction.deferred || interaction.replied) {
-        return await interaction.editReply({ content }).catch(async () => {
-          return interaction.followUp({ content, ephemeral: true }).catch(() => null);
-        });
+        return await interaction.editReply({ content }).catch(async () => interaction.followUp({ content, ephemeral: true }).catch(() => null));
       }
-
       return await interaction.reply({ content, ephemeral: true }).catch(() => null);
     } catch (err) {
       console.error("⚠️ Private Ticket-Antwort fehlgeschlagen:", err?.message || err);
@@ -1801,14 +1842,12 @@ async function handleTicketCloseDecision(interaction, closeToken, decision) {
     }
   }
 
-  // 1) SOFORT bestätigen. Das ist der wichtigste Teil gegen dauerhaftes Laden.
   try {
     if (!interaction.deferred && !interaction.replied) {
       await interaction.deferReply({ ephemeral: true });
     }
   } catch (err) {
     console.error("❌ Close-Button konnte nicht sofort bestätigt werden:", err?.message || err);
-    // Falls Discord die Interaktion schon als bestätigt sieht, machen wir trotzdem weiter.
   }
 
   await safePrivate(decision === "confirm" ? "⏳ Ticket wird geschlossen..." : "⏳ Schließungsanfrage wird abgebrochen...");
@@ -1816,10 +1855,7 @@ async function handleTicketCloseDecision(interaction, closeToken, decision) {
   try {
     console.log(`🔄 Ticket-Close-Decision gestartet | decision=${decision} | token=${closeToken}`);
 
-    let thread = interaction.channel?.isThread?.()
-      ? interaction.channel
-      : null;
-
+    let thread = interaction.channel?.isThread?.() ? interaction.channel : null;
     let ticket = null;
 
     if (thread?.isThread?.()) {
@@ -1859,8 +1895,9 @@ async function handleTicketCloseDecision(interaction, closeToken, decision) {
 
     if (decision === "confirm") {
       await runStep("Close-Buttons deaktivieren", () => interaction.message.edit({ components: disableActionRows(interaction.message.components) }), 4000);
-      await runStep("Ticket schließen und archivieren", () => archiveTicketForDeletion(thread, ticket, interaction.user.id, "Das Ticket wurde bestätigt geschlossen."), 10000);
-      return safePrivate("✅ Ticket wurde geschlossen und archiviert.");
+      await runStep("Ticket schließen: DB und Nachricht", () => archiveTicketForDeletion(thread, ticket, interaction.user.id, "Das Ticket wurde bestätigt geschlossen."), 12000);
+      console.log(`✅ Ticket-Schließung bestätigt | thread=${ticket.thread_id || thread.id}`);
+      return safePrivate("✅ Ticket wurde geschlossen. Lock/Archivierung läuft im Hintergrund, damit nichts mehr hängt.");
     }
 
     // =====================
@@ -1869,8 +1906,6 @@ async function handleTicketCloseDecision(interaction, closeToken, decision) {
     const restoreName = getRestoreTicketName(ticket);
     const threadId = ticket.thread_id || thread.id;
 
-    // Wichtig: Status zuerst zurücksetzen. Selbst wenn danach eine Nachricht/Umbenennung fehlschlägt,
-    // kann das Ticket danach wieder geschlossen werden.
     await runStep(
       "DB-Status auf open zurücksetzen",
       () =>
@@ -1892,25 +1927,12 @@ async function handleTicketCloseDecision(interaction, closeToken, decision) {
       5000
     );
 
-    // Buttons deaktivieren, damit nicht doppelt geklickt wird. Wenn das fehlschlägt, trotzdem weiter.
-    await runStep(
-      "Schließen/Abbrechen-Buttons deaktivieren",
-      () => interaction.message.edit({ components: disableActionRows(interaction.message.components) }),
-      4000
-    );
+    await runStep("Schließen/Abbrechen-Buttons deaktivieren", () => interaction.message.edit({ components: disableActionRows(interaction.message.components) }), 4000);
 
-    // Falls der Thread schon archiviert/gelockt ist, freigeben. Bei normalen offenen Threads kann das auch fehlschlagen, ist nicht kritisch.
-    await runStep("Thread entarchivieren", () => thread.setArchived(false, "Schließungsanfrage abgebrochen"), 4000);
-    await runStep("Thread entsperren", () => thread.setLocked(false, "Schließungsanfrage abgebrochen"), 4000);
+    // Kein await auf Rename/Unlock: Das waren die Timeouts in deinen Logs.
+    safeThreadUnarchiveUnlock(thread, "Schließungsanfrage abgebrochen");
+    safeThreadRename(thread, restoreName, `Schließung abgebrochen von ${interaction.user.tag}`, "Threadname nach Abbruch zurücksetzen");
 
-    // Name zurücksetzen. Nicht kritisch, falls Discord/Ratelimit meckert.
-    await runStep(
-      "Threadname zurücksetzen",
-      () => thread.setName(restoreName, `Schließung abgebrochen von ${interaction.user.tag}`),
-      5000
-    );
-
-    // Öffentliche Nachricht mit @everyone. Das ist der gewünschte sichtbare Teil.
     const sendResult = await runStep(
       "Öffentliche Abbruch-Nachricht senden",
       () =>
@@ -1921,24 +1943,19 @@ async function handleTicketCloseDecision(interaction, closeToken, decision) {
             `<@${interaction.user.id}> hat die Schließungsanfrage abgebrochen.\n\n` +
             `📌 Status: **Offen**\n` +
             `Das Ticket kann wieder normal bearbeitet und später erneut geschlossen werden.`,
-          allowedMentions: {
-            parse: ["everyone"],
-            users: [interaction.user.id],
-          },
+          allowedMentions: { parse: ["everyone"], users: [interaction.user.id] },
         }),
-      7000
+      8000
     );
 
     if (!sendResult.ok) {
-      return safePrivate(
-        "⚠️ Der Ticketstatus wurde zurückgesetzt, aber die öffentliche Nachricht konnte nicht gesendet werden. Prüfe bitte Bot-Rechte: View Channel, Send Messages, Mention Everyone und Thread-Zugriff."
-      );
+      return safePrivate("⚠️ Der Ticketstatus wurde zurückgesetzt, aber die öffentliche Nachricht konnte nicht gesendet werden. Prüfe Bot-Rechte im Thread.");
     }
 
     console.log(`✅ Schließungsanfrage erfolgreich abgebrochen | thread=${threadId}`);
     return safePrivate("✅ Schließungsanfrage wurde abgebrochen. Das Ticket ist wieder offen und @everyone wurde erwähnt.");
   } catch (err) {
-    console.error("❌ Unerwarteter Fehler bei Ticket-Schließungsentscheidung:", err);
+    console.error("❌ Unerwarteter Fehler bei Ticket-Schließungsentscheidung:", err?.message || err);
     return safePrivate("❌ Beim Verarbeiten der Schließungsentscheidung ist ein Fehler passiert. Schau bitte in die Railway Logs.");
   }
 }
@@ -3794,9 +3811,8 @@ client.on("interactionCreate", async (interaction) => {
         await thread.setLocked(false, "Ticket wieder geöffnet").catch((err) => {
           console.error("❌ Ticket konnte nicht entsperrt werden:", err?.message || err);
         });
-        await thread.setName(restoreName, `Ticket wieder geöffnet von ${interaction.user.tag}`).catch((err) => {
-          console.error("❌ Ticket konnte beim Öffnen nicht umbenannt werden:", err?.message || err);
-        });
+        // Rename nicht blockierend ausführen, damit /ticket-open nicht hängen bleibt.
+        safeThreadRename(thread, restoreName, `Ticket wieder geöffnet von ${interaction.user.tag}`, "Ticket beim Öffnen umbenennen");
 
         await query(
           `
