@@ -1531,6 +1531,23 @@ function scheduleTicketStaffAutoAdd(threadId, categoryKey, delayMs = 1500) {
   if (ticketAutoAddJobs.has(jobKey)) return;
   ticketAutoAddJobs.add(jobKey);
 
+  const needsFullStaffFetch = categoryKey === "bungalow" || categoryKey === "allgemein";
+
+  // Bungalow und Allgemeine Anfrage sollen wirklich alle passenden Staff-Rollen bekommen.
+  // Deshalb laufen mehrere Nachzieh-Versuche. Falls Discord beim ersten Full-Fetch limitiert,
+  // versucht der Bot es später erneut und lädt die fehlenden Teammitglieder nach.
+  const passes = needsFullStaffFetch
+    ? [
+        { wait: 0, force: false, label: "Cache-Sofortcheck" },
+        { wait: 3500, force: true, label: "Full-Fetch Nachziehen 1" },
+        { wait: 12000, force: true, label: "Full-Fetch Nachziehen 2" },
+        { wait: 30000, force: true, label: "Full-Fetch Nachziehen 3" },
+      ]
+    : [
+        { wait: 0, force: false, label: "Cache-Sofortcheck" },
+        { wait: 3500, force: true, label: "Restricted-Rollen Nachziehen" },
+      ];
+
   setTimeout(async () => {
     try {
       const guild = await client.guilds.fetch(GUILD_ID).catch(() => null);
@@ -1545,10 +1562,19 @@ function scheduleTicketStaffAutoAdd(threadId, categoryKey, delayMs = 1500) {
         console.error("⚠️ Bot konnte dem Ticket-Thread nicht beitreten:", err?.message || err);
       });
 
-      await addRoleMembersToThreadFromCache(thread, guild, categoryKey, "Cache vor Full-Fetch");
-      const forceFullFetch = categoryKey === "bungalow" || categoryKey === "allgemein";
-      await fetchAllGuildMembersForTicketAutoAdd(guild, `Ticket ${thread.name}`, forceFullFetch);
-      await addRoleMembersToThreadFromCache(thread, guild, categoryKey, forceFullFetch ? "Full-Fetch wie Bungalow/Allgemein" : "Cache nach Hintergrund-Fetch");
+      for (const pass of passes) {
+        if (pass.wait > 0) await ticketSleep(pass.wait);
+
+        try {
+          if (pass.force) {
+            await fetchAllGuildMembersForTicketAutoAdd(guild, `${pass.label} | Ticket ${thread.name}`, true);
+          }
+
+          await addRoleMembersToThreadFromCache(thread, guild, categoryKey, pass.label);
+        } catch (passErr) {
+          console.error(`❌ Ticket-Auto-Add Pass fehlgeschlagen (${pass.label}):`, passErr?.message || passErr);
+        }
+      }
     } catch (err) {
       console.error("❌ Ticket-Auto-Add Hintergrundjob fehlgeschlagen:", err?.message || err);
     } finally {
