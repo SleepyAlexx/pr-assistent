@@ -1429,25 +1429,33 @@ async function fetchAllGuildMembersForTicketAutoAdd(guild, reason = "Ticket-Auto
 
   ticketFullMemberFetchPromise = (async () => {
     try {
-      console.log(`🔄 Member-Fetch für ${reason} wird im Hintergrund gestartet...`);
-      const members = await guild.members.fetch();
+      console.log(`🔄 Member-Fetch für ${reason} wird gestartet...`);
+      const members = await guild.members.fetch({ cache: true });
       ticketLastFullMemberFetchAt = Date.now();
       console.log(`✅ Member-Fetch fertig: ${members.size} Mitglieder im Cache.`);
       return members;
     } catch (err) {
       const waitMs = getDiscordRetryAfterMs(err, 9000);
-      console.error(`⚠️ Member-Fetch wurde limitiert/ist fehlgeschlagen. Nutze Cache und retry in ${Math.round(waitMs / 1000)}s.`, err?.message || err);
+      console.error(
+        `⚠️ Member-Fetch fehlgeschlagen/limitiert für ${reason}. Warte ${Math.round(waitMs / 1000)}s und versuche es nochmal...`,
+        err?.message || err
+      );
 
-      setTimeout(async () => {
+      if (forceFullFetch) {
         try {
-          console.log("🔁 Member-Fetch Retry für Ticket-Auto-Add startet...");
-          const members = await guild.members.fetch();
+          await ticketSleep(waitMs);
+          console.log(`🔁 Member-Fetch Retry läuft jetzt für ${reason}...`);
+          const retryMembers = await guild.members.fetch({ cache: true });
           ticketLastFullMemberFetchAt = Date.now();
-          console.log(`✅ Member-Fetch Retry fertig: ${members.size} Mitglieder im Cache.`);
+          console.log(`✅ Member-Fetch Retry fertig: ${retryMembers.size} Mitglieder im Cache.`);
+          return retryMembers;
         } catch (retryErr) {
-          console.error("❌ Member-Fetch Retry fehlgeschlagen:", retryErr?.message || retryErr);
+          console.error(
+            "❌ Member-Fetch Retry fehlgeschlagen. Prüfe im Discord Developer Portal, ob SERVER MEMBERS INTENT aktiv ist:",
+            retryErr?.message || retryErr
+          );
         }
-      }, waitMs);
+      }
 
       return guild.members.cache;
     } finally {
@@ -1539,13 +1547,14 @@ function scheduleTicketStaffAutoAdd(threadId, categoryKey, delayMs = 1500) {
   const passes = needsFullStaffFetch
     ? [
         { wait: 0, force: false, label: "Cache-Sofortcheck" },
-        { wait: 3500, force: true, label: "Full-Fetch Nachziehen 1" },
-        { wait: 12000, force: true, label: "Full-Fetch Nachziehen 2" },
-        { wait: 30000, force: true, label: "Full-Fetch Nachziehen 3" },
+        { wait: 1500, force: true, label: "Full-Fetch Staff sofort nachziehen" },
+        { wait: 7000, force: true, label: "Full-Fetch Staff Nachziehen 2" },
+        { wait: 18000, force: true, label: "Full-Fetch Staff Nachziehen 3" },
+        { wait: 45000, force: true, label: "Full-Fetch Staff finaler Nachzug" },
       ]
     : [
         { wait: 0, force: false, label: "Cache-Sofortcheck" },
-        { wait: 3500, force: true, label: "Restricted-Rollen Nachziehen" },
+        { wait: 2500, force: true, label: "Restricted-Rollen Nachziehen" },
       ];
 
   setTimeout(async () => {
