@@ -1028,8 +1028,14 @@ function memberTicketName(member, user) {
 }
 
 function categoryRoles(categoryKey) {
+  // Essensstand und Event bleiben bewusst enger beschränkt.
   if (categoryKey === "essensstand" || categoryKey === "event") {
     return TICKET_RESTRICTED_EVENT_ROLE_IDS;
+  }
+
+  // Allgemeine Anfrage soll exakt wie Bungalow laufen: alle Staff-/Teamrollen dürfen rein und Commands nutzen.
+  if (categoryKey === "bungalow" || categoryKey === "allgemein") {
+    return TICKET_STAFF_ROLE_IDS;
   }
 
   const category = TICKET_CATEGORIES[categoryKey];
@@ -1037,8 +1043,14 @@ function categoryRoles(categoryKey) {
 }
 
 function ticketAutoAddRoles(categoryKey) {
+  // Essensstand und Event: nur die eingeschränkten Rollen + Full-Access-Rollen.
   if (categoryKey === "essensstand" || categoryKey === "event") {
     return TICKET_RESTRICTED_EVENT_ROLE_IDS;
+  }
+
+  // Allgemeine Anfrage lädt jetzt dieselben Rollen wie Bungalow automatisch in den privaten Thread ein.
+  if (categoryKey === "bungalow" || categoryKey === "allgemein") {
+    return TICKET_STAFF_ROLE_IDS;
   }
 
   return TICKET_AUTO_ADD_ROLE_IDS;
@@ -1404,14 +1416,14 @@ function getDiscordRetryAfterMs(err, fallbackMs = 8000) {
   return fallbackMs;
 }
 
-async function fetchAllGuildMembersForTicketAutoAdd(guild, reason = "Ticket-Auto-Add") {
+async function fetchAllGuildMembersForTicketAutoAdd(guild, reason = "Ticket-Auto-Add", forceFullFetch = false) {
   if (ticketFullMemberFetchPromise) return ticketFullMemberFetchPromise;
 
   const now = Date.now();
   const cooldownMs = 90 * 1000;
   const cacheHasUsefulMembers = guild.members.cache.filter((m) => !m.user?.bot).size > 0;
 
-  if (cacheHasUsefulMembers && now - ticketLastFullMemberFetchAt < cooldownMs) {
+  if (!forceFullFetch && cacheHasUsefulMembers && now - ticketLastFullMemberFetchAt < cooldownMs) {
     return guild.members.cache;
   }
 
@@ -1534,8 +1546,9 @@ function scheduleTicketStaffAutoAdd(threadId, categoryKey, delayMs = 1500) {
       });
 
       await addRoleMembersToThreadFromCache(thread, guild, categoryKey, "Cache vor Full-Fetch");
-      await fetchAllGuildMembersForTicketAutoAdd(guild, `Ticket ${thread.name}`);
-      await addRoleMembersToThreadFromCache(thread, guild, categoryKey, "Cache nach Hintergrund-Fetch");
+      const forceFullFetch = categoryKey === "bungalow" || categoryKey === "allgemein";
+      await fetchAllGuildMembersForTicketAutoAdd(guild, `Ticket ${thread.name}`, forceFullFetch);
+      await addRoleMembersToThreadFromCache(thread, guild, categoryKey, forceFullFetch ? "Full-Fetch wie Bungalow/Allgemein" : "Cache nach Hintergrund-Fetch");
     } catch (err) {
       console.error("❌ Ticket-Auto-Add Hintergrundjob fehlgeschlagen:", err?.message || err);
     } finally {
