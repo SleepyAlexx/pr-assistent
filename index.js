@@ -1602,9 +1602,14 @@ async function archiveTicketForDeletion(thread, ticket, actorId, reasonText) {
 }
 
 async function handleTicketCloseDecision(interaction, closeToken, decision) {
-  // Wichtig: Bei Buttons sofort sichtbar antworten.
-  // So sieht man nicht mehr "es passiert nichts", sondern bekommt direkt Feedback.
-  await interaction.deferReply({ ephemeral: true }).catch(() => null);
+  // Extrem wichtig: Button SOFORT bestätigen, sonst lädt Discord dauerhaft.
+  try {
+    if (!interaction.deferred && !interaction.replied) {
+      await interaction.deferUpdate();
+    }
+  } catch (err) {
+    console.error("⚠️ Close-Button konnte nicht sofort bestätigt werden:", err?.message || err);
+  }
 
   try {
     let thread = interaction.channel?.isThread?.()
@@ -1613,26 +1618,27 @@ async function handleTicketCloseDecision(interaction, closeToken, decision) {
 
     let ticket = await getTicketFromCloseToken(closeToken);
 
-    // Fallback: Falls die DB den Token nicht findet, Ticket aus dem aktuellen Thread wiederherstellen.
-    // Das verhindert, dass alte Close-Buttons hängen bleiben.
+    // Wichtig für alte Buttons: Wenn der gespeicherte Token nicht passt,
+    // wird das Ticket direkt aus dem aktuellen Thread geholt.
     if (!ticket && thread?.isThread?.()) {
       ticket = await getOrRecoverTicketFromThread(thread);
     }
 
-    // Fallback 2: Wenn der Thread noch nicht geladen ist, aber die DB das Ticket kennt.
     if (!thread && ticket?.thread_id) {
       thread = await client.channels.fetch(ticket.thread_id).catch(() => null);
     }
 
     if (!thread) {
-      return interaction.editReply({
-        content: "❌ Der Ticket-Thread wurde nicht gefunden. Prüfe bitte, ob der Thread noch existiert.",
+      return interaction.followUp({
+        content: "❌ Der Ticket-Thread wurde nicht gefunden. Bitte prüfe, ob der Thread noch existiert.",
+        ephemeral: true,
       }).catch(() => null);
     }
 
     if (!ticket) {
-      return interaction.editReply({
-        content: "❌ Ticket wurde in der Datenbank nicht gefunden. Ich konnte den Button deshalb nicht verarbeiten.",
+      return interaction.followUp({
+        content: "❌ Das Ticket wurde in der Datenbank nicht gefunden. Bitte schließe/öffne das Ticket über ein neues Ticketpanel erneut.",
+        ephemeral: true,
       }).catch(() => null);
     }
 
@@ -1640,22 +1646,24 @@ async function handleTicketCloseDecision(interaction, closeToken, decision) {
     const isTicketOpener = interaction.user.id === ticket.opener_id;
 
     if (!isTicketOpener && !memberCanManage) {
-      return interaction.editReply({
+      return interaction.followUp({
         content: "❌ Nur der Ticket-Ersteller oder berechtigte Teammitglieder dürfen diese Schließung bestätigen oder abbrechen.",
+        ephemeral: true,
       }).catch(() => null);
     }
 
-    // Buttons deaktivieren, aber falls Discord das Edit blockt, läuft der Rest trotzdem weiter.
+    // Button deaktivieren. Wenn das nicht klappt, soll trotzdem alles weiterlaufen.
     await interaction.message.edit({ components: disableActionRows(interaction.message.components) }).catch((err) => {
       console.error("⚠️ Ticket-Close-Buttons konnten nicht deaktiviert werden:", err?.message || err);
     });
 
     if (decision === "confirm") {
-      await interaction.editReply({ content: "🔒 Ticket wird geschlossen..." }).catch(() => null);
+      await interaction.followUp({ content: "🔒 Ticket wird geschlossen...", ephemeral: true }).catch(() => null);
       await archiveTicketForDeletion(thread, ticket, interaction.user.id, "Das Ticket wurde bestätigt geschlossen.");
       return;
     }
 
+    // ===== ABBRECHEN =====
     const restoreName = getRestoreTicketName(ticket);
 
     await thread.setArchived(false, "Schließung abgebrochen").catch(() => null);
@@ -1684,7 +1692,7 @@ async function handleTicketCloseDecision(interaction, closeToken, decision) {
     await thread.send({
       content:
         `@everyone\n\n` +
-        `❌ ・SCHLIESSUNG ABGEBROCHEN\n\n` +
+        `❌ ・SCHLIESSUNGSANFRAGE ABGEBROCHEN\n\n` +
         `<@${interaction.user.id}> hat die Schließungsanfrage abgebrochen.\n\n` +
         `📌 Status: **Offen**\n` +
         `Das Ticket kann wieder normal bearbeitet und später erneut geschlossen werden.`,
@@ -1694,19 +1702,21 @@ async function handleTicketCloseDecision(interaction, closeToken, decision) {
       },
     }).catch(async (err) => {
       console.error("❌ Abbruch-Nachricht konnte nicht gesendet werden:", err?.message || err);
-      await interaction.editReply({
+      await interaction.followUp({
         content: "⚠️ Status wurde zurückgesetzt, aber die Nachricht konnte nicht in den Thread gesendet werden. Prüfe die Bot-Rechte.",
+        ephemeral: true,
       }).catch(() => null);
-      return;
     });
 
-    return interaction.editReply({
+    return interaction.followUp({
       content: "✅ Schließungsanfrage wurde abgebrochen. Das Ticket ist wieder offen.",
+      ephemeral: true,
     }).catch(() => null);
   } catch (err) {
     console.error("❌ Fehler bei Ticket-Schließungsentscheidung:", err);
-    return interaction.editReply({
+    return interaction.followUp({
       content: "❌ Beim Verarbeiten der Schließungsentscheidung ist ein Fehler passiert. Schau bitte in die Railway Logs.",
+      ephemeral: true,
     }).catch(() => null);
   }
 }
@@ -3806,6 +3816,24 @@ client.on("interactionCreate", async (interaction) => {
     // BUTTONS
     // =====================
     if (interaction.isButton()) {
+      // TICKET-CLOSE BUTTONS GANZ OBEN ABFANGEN
+      // Dadurch lädt "Abbrechen"/"Schließen" nicht ewig, selbst wenn darunter andere Button-Logik länger braucht.
+      if (
+        interaction.customId.startsWith("ticket_close_confirm_") ||
+        interaction.customId.startsWith("ticket_close_cancel_") ||
+        interaction.customId.startsWith("ticket_cancel_close_") ||
+        interaction.customId.startsWith("ticket_close_abort_")
+      ) {
+        let closeToken = interaction.customId
+          .replace("ticket_close_confirm_", "")
+          .replace("ticket_close_cancel_", "")
+          .replace("ticket_cancel_close_", "")
+          .replace("ticket_close_abort_", "");
+
+        const decision = interaction.customId.includes("confirm") ? "confirm" : "cancel";
+        return handleTicketCloseDecision(interaction, closeToken, decision);
+      }
+
       // ZEITVERWALTUNG START
       if (
         interaction.customId === "time_add_start" ||
