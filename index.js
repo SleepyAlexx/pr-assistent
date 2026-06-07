@@ -1258,10 +1258,6 @@ async function sendTicketDebugLog(message) {
 }
 
 async function fetchCachedGuildMembersForTickets(guild, roleIds) {
-  // Robust-Fix: KEIN guild.members.fetch() mehr.
-  // Der alte Code hat bei jedem Ticket alle Server-Mitglieder geladen und dadurch Discord-Rate-Limits ausgelöst.
-  // Private Threads können keine Rollen direkt bekommen; Discord erlaubt nur einzelne Mitglieder.
-  // Deshalb nutzen wir nur den vorhandenen Member-Cache und blockieren den Ticket-Ablauf nicht mehr.
   const members = guild.members.cache.filter((member) => {
     if (!member || member.user?.bot) return false;
     return memberHasAnyRole(member, roleIds);
@@ -1269,9 +1265,173 @@ async function fetchCachedGuildMembersForTickets(guild, roleIds) {
 
   return {
     members,
-    source: "guild.members.cache (kein Full-Fetch, kein Rate-Limit)",
+    source: "guild.members.cache",
     error: null,
   };
+}
+
+let ticketFullMemberFetchPromise = null;
+let ticketLastFullMemberFetchAt = 0;
+const ticketAutoAddJobs = new Set();
+
+function ticketSleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getDiscordRetryAfterMs(err, fallbackMs = 8000) {
+  const retrySeconds =
+    err?.data?.retry_after ??
+    err?.data?.retryAfter ??
+    err?.retry_after ??
+    err?.retryAfter ??
+    err?.rawError?.retry_after;
+
+  const parsed = Number(retrySeconds);
+  if (Number.isFinite(parsed) && parsed > 0) return Math.ceil(parsed * 1000) + 750;
+  return fallbackMs;
+}
+
+async function fetchAllGuildMembersForTicketAutoAdd(guild, reason = "Ticket-Auto-Add") {
+  // Private Threads können keine Rollen direkt bekommen, sondern nur einzelne Mitglieder.
+  // Deshalb braucht der Bot manchmal die Member-Liste. Das läuft nur im Hintergrund,
+  // damit Buttons und Slash-Commands niemals dadurch hängen bleiben.
+  if (ticketFullMemberFetchPromise) return ticketFullMemberFetchPromise;
+
+  const now = Date.now();
+  const cooldownMs = 90 * 1000;
+  const cacheHasUsefulMembers = guild.members.cache.filter((m) => !m.user?.bot).size > 0;
+
+  if (cacheHasUsefulMembers && now - ticketLastFullMemberFetchAt < cooldownMs) {
+    return guild.members.cache;
+  }
+
+  ticketFullMemberFetchPromise = (async () => {
+    try {
+      console.log(`🔄 Member-Fetch für ${reason} wird im Hintergrund gestartet...`);
+      const members = await guild.members.fetch();
+      ticketLastFullMemberFetchAt = Date.now();
+      console.log(`✅ Member-Fetch fertig: ${members.size} Mitglieder im Cache.`);
+      return members;
+    } catch (err) {
+      const waitMs = getDiscordRetryAfterMs(err, 9000);
+      console.error(`⚠️ Member-Fetch wurde limitiert/ist fehlgeschlagen. Nutze Cache und retry in ${Math.round(waitMs / 1000)}s.`, err?.message || err);
+
+      setTimeout(async () => {
+        try {
+          console.log("🔁 Member-Fetch Retry für Ticket-Auto-Add startet...");
+          const members = await guild.members.fetch();
+          ticketLastFullMemberFetchAt = Date.now();
+          console.log(`✅ Member-Fetch Retry fertig: ${members.size} Mitglieder im Cache.`);
+        } catch (retryErr) {
+          console.error("❌ Member-Fetch Retry fehlgeschlagen:", retryErr?.message || retryErr);
+        }
+      }, waitMs);
+
+      return guild.members.cache;
+    } finally {
+      ticketFullMemberFetchPromise = null;
+    }
+  })();
+
+  return ticketFullMemberFetchPromise;
+}
+
+async function addRoleMembersToThreadFromCache(thread, guild, categoryKey, sourceLabel) {
+  const allowedRoles = ticketAutoAddRoles(categoryKey);
+  const removedUserIds = await getRemovedTicketUserIds(thread.id).catch(() => new Set());
+
+  const candidates = guild.members.cache.filter((member) => {
+    if (!member || member.user?.bot) return false;
+    if (removedUserIds.has(member.id)) return false;
+    return memberHasAnyRole(member, allowedRoles);
+  });
+
+  const added = [];
+  const alreadyInThread = [];
+  const failed = [];
+
+  for (const [, member] of candidates) {
+    try {
+      if (await isTicketUserRemoved(thread.id, member.id)) continue;
+
+      if (thread.members.cache?.has?.(member.id)) {
+        alreadyInThread.push(`${member.user.tag} (${member.id})`);
+        continue;
+      }
+
+      await thread.members.add(member.id);
+      added.push(`${member.user.tag} (${member.id})`);
+      await ticketSleep(450);
+    } catch (err) {
+      failed.push(`${member.user.tag} (${member.id}) → ${err?.code || "NO_CODE"}: ${err?.message || err}`);
+      console.error(`❌ Konnte ${member.user.tag} (${member.id}) nicht zum Ticket-Thread hinzufügen:`, err?.message || err);
+    }
+  }
+
+  const roleText = allowedRoles.map((roleId) => {
+    const role = guild.roles.cache.get(roleId);
+    return role ? `${role.name} (${roleId})` : roleId;
+  }).join("\n");
+
+  await sendTicketDebugLog(
+    `🎫 **Ticket-Auto-Add** (${categoryKey})
+` +
+    `Thread: ${thread.name} (${thread.id})
+` +
+    `Quelle: **${sourceLabel}**
+` +
+    `Erlaubte Rollen:
+${roleText}
+
+` +
+    `Gefundene Teammitglieder: **${candidates.size}**
+` +
+    `Neu hinzugefügt: **${added.length}**
+` +
+    `Schon drin: **${alreadyInThread.length}**
+` +
+    `Fehlgeschlagen: **${failed.length}**
+
+` +
+    (added.length ? `**Hinzugefügt:**
+${added.slice(0, 15).join("\n")}
+
+` : "") +
+    (failed.length ? `**Fehler:**
+${failed.slice(0, 10).join("\n")}` : "✅ Auto-Add abgeschlossen.")
+  ).catch(() => null);
+
+  return { added: added.length, failed: failed.length, found: candidates.size, already: alreadyInThread.length };
+}
+
+function scheduleTicketStaffAutoAdd(threadId, categoryKey, delayMs = 1500) {
+  const jobKey = `${threadId}:${categoryKey}`;
+  if (ticketAutoAddJobs.has(jobKey)) return;
+  ticketAutoAddJobs.add(jobKey);
+
+  setTimeout(async () => {
+    try {
+      const guild = await client.guilds.fetch(GUILD_ID).catch(() => null);
+      const thread = await client.channels.fetch(threadId).catch(() => null);
+
+      if (!guild || !thread?.isThread?.()) {
+        console.error("❌ Ticket-Auto-Add Hintergrundjob: Guild oder Thread nicht gefunden.");
+        return;
+      }
+
+      await thread.join().catch((err) => {
+        console.error("⚠️ Bot konnte dem Ticket-Thread nicht beitreten:", err?.message || err);
+      });
+
+      await addRoleMembersToThreadFromCache(thread, guild, categoryKey, "Cache vor Full-Fetch");
+      await fetchAllGuildMembersForTicketAutoAdd(guild, `Ticket ${thread.name}`);
+      await addRoleMembersToThreadFromCache(thread, guild, categoryKey, "Cache nach Hintergrund-Fetch");
+    } catch (err) {
+      console.error("❌ Ticket-Auto-Add Hintergrundjob fehlgeschlagen:", err?.message || err);
+    } finally {
+      ticketAutoAddJobs.delete(jobKey);
+    }
+  }, delayMs);
 }
 
 async function addAllowedStaffToThread(thread, categoryKey) {
@@ -1286,60 +1446,18 @@ async function addAllowedStaffToThread(thread, categoryKey) {
       console.error("⚠️ Bot konnte dem Ticket-Thread nicht beitreten:", err?.message || err);
     });
 
-    const allowedRoles = ticketAutoAddRoles(categoryKey);
-    const removedUserIds = await getRemovedTicketUserIds(thread.id).catch(() => new Set());
-    const fetchResult = await fetchCachedGuildMembersForTickets(guild, allowedRoles);
-    const members = fetchResult.members;
+    const result = await addRoleMembersToThreadFromCache(thread, guild, categoryKey, "Sofort-Cache");
+    scheduleTicketStaffAutoAdd(thread.id, categoryKey, 2500);
 
-    const candidates = members.filter((member) => {
-      if (!member || member.user?.bot) return false;
-      if (removedUserIds.has(member.id)) return false;
-      return memberHasAnyRole(member, allowedRoles);
-    });
-
-    const added = [];
-    const failed = [];
-
-    for (const [, member] of candidates) {
-      try {
-        if (await isTicketUserRemoved(thread.id, member.id)) continue;
-        await thread.members.add(member.id).catch((err) => { throw err; });
-        added.push(`${member.user.tag} (${member.id})`);
-        await new Promise((resolve) => setTimeout(resolve, 350));
-      } catch (err) {
-        failed.push(`${member.user.tag} (${member.id}) → ${err?.code || "NO_CODE"}: ${err?.message || err}`);
-        console.error(`❌ Konnte ${member.user.tag} (${member.id}) nicht zum Ticket-Thread hinzufügen:`, err?.message || err);
-      }
-    }
-
-    const roleText = allowedRoles.map((roleId) => {
-      const role = guild.roles.cache.get(roleId);
-      return role ? `${role.name} (${roleId})` : roleId;
-    }).join("\n");
-
-    await sendTicketDebugLog(
-      `🎫 **Ticket-Debug** (${categoryKey})\n` +
-      `Thread: ${thread.name} (${thread.id})\n` +
-      `Member-Quelle: **${fetchResult.source}**\n` +
-      `Erlaubte Rollen:\n${roleText}\n\n` +
-      `Gefundene gecachte Teammitglieder: **${candidates.size}**\n` +
-      `Automatisch hinzugefügt: **${added.length}**\n` +
-      `Fehlgeschlagen: **${failed.length}**\n\n` +
-      (added.length ? `**Hinzugefügt:**\n${added.slice(0, 12).join("\n")}\n\n` : "") +
-      (failed.length ? `**Fehler:**\n${failed.slice(0, 10).join("\n")}` : "✅ Ticket-Auto-Add abgeschlossen.") +
-      `\n\nℹ️ Hinweis: Der Bot lädt absichtlich nicht mehr alle Server-Mitglieder, damit keine Rate-Limits entstehen. ` +
-      `Wer nicht automatisch hinzugefügt wurde, kann mit \`/ticket-add\` ergänzt werden.`
-    ).catch(() => null);
-
-    return { added: added.length, failed: failed.length, found: candidates.size };
+    return result;
   } catch (err) {
     console.error("❌ Fehler in addAllowedStaffToThread:", err?.message || err);
+    scheduleTicketStaffAutoAdd(thread.id, categoryKey, 3000);
     return { added: 0, failed: 1, found: 0 };
   }
 }
 
 async function createTicketFromButton(interaction, categoryKey) {
-  // Sofort antworten, damit der Ticket-Button niemals ewig lädt.
   await interaction.deferReply({ ephemeral: true }).catch(() => null);
 
   try {
@@ -1362,6 +1480,7 @@ async function createTicketFromButton(interaction, categoryKey) {
       reason: `Ticket erstellt von ${interaction.user.tag}`,
     });
 
+    await thread.join().catch(() => null);
     await thread.members.add(interaction.user.id).catch((err) => {
       console.error("❌ Ticket-Ersteller konnte nicht zum Thread hinzugefügt werden:", err?.message || err);
     });
@@ -1405,13 +1524,14 @@ async function createTicketFromButton(interaction, categoryKey) {
       console.error("❌ Ticket-Startnachricht konnte nicht gesendet werden:", err?.message || err);
     });
 
-    await interaction.editReply({ content: `✅ Dein Ticket wurde erstellt: ${thread}` }).catch(() => null);
+    await interaction.editReply({ content: `✅ Dein Ticket wurde erstellt: ${thread}
+⏳ Teammitglieder werden im Hintergrund hinzugefügt.` }).catch(() => null);
 
-    // Auto-Add läuft absichtlich im Hintergrund. Dadurch blockiert es keine Buttons und keine Slash-Commands.
     addAllowedStaffToThread(thread, categoryKey).then((staffAddResult) => {
       console.log(`🎫 Ticket erstellt: ${categoryKey} | Gefunden: ${staffAddResult.found || 0} | Hinzugefügt: ${staffAddResult.added || 0} | Fehler: ${staffAddResult.failed || 0}`);
     }).catch((err) => {
       console.error("❌ Ticket-Auto-Add Hintergrundfehler:", err?.message || err);
+      scheduleTicketStaffAutoAdd(thread.id, categoryKey, 3000);
     });
   } catch (err) {
     console.error("❌ Fehler beim Erstellen des Tickets:", err);
@@ -1420,6 +1540,7 @@ async function createTicketFromButton(interaction, categoryKey) {
     }).catch(() => null);
   }
 }
+
 
 async function claimTicket(interaction) {
   const ticket = await ensureTicketThread(interaction);
@@ -3344,7 +3465,13 @@ client.on("interactionCreate", async (interaction) => {
     // SLASH COMMANDS
     // =====================
     if (interaction.isChatInputCommand()) {
-      if (isRestrictedCitizenCommandUser(interaction.member)) {
+      const isTicketSlashCommand =
+        interaction.commandName.startsWith("ticket-") || interaction.commandName === "ticketclose";
+
+      // Bürger sollen keine normalen Bot-Commands nutzen.
+      // Ticket-Commands lassen wir hier aber durch, damit die Ticket-eigenen Berechtigungen sauber antworten
+      // und Staff/Ersteller im privaten Thread nicht versehentlich blockiert werden.
+      if (!isTicketSlashCommand && isRestrictedCitizenCommandUser(interaction.member)) {
         return interaction.reply({
           content: "❌ Bürger können keine Bot-Commands benutzen.",
           ephemeral: true,
@@ -3502,39 +3629,72 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       if (interaction.commandName === "ticket-add") {
-        const ticket = await ensureTicketThread(interaction);
-        if (!ticket) return;
-        if (!canUseTicketStaffCommands(interaction.member, ticket.category)) {
-          return interaction.reply({ content: "❌ Du darfst dieses Ticket nicht verwalten.", ephemeral: true });
+        await interaction.deferReply({ ephemeral: false }).catch(() => null);
+
+        if (!interaction.channel?.isThread?.()) {
+          await interaction.editReply({ content: "❌ Dieser Command kann nur in einem Ticket-Thread genutzt werden." }).catch(() => null);
+          return;
         }
-        const target = interaction.options.getUser("user");
-        await unmarkTicketUserRemoved(interaction.channel.id, target.id);
-        await interaction.channel.members.add(target.id).catch((err) => {
+
+        const ticket = await getOrRecoverTicketFromThread(interaction.channel);
+        if (!ticket) {
+          await interaction.editReply({ content: "❌ Dieser Thread ist kein bekanntes Ticket." }).catch(() => null);
+          return;
+        }
+
+        if (!canUseTicketStaffCommands(interaction.member, ticket.category)) {
+          await interaction.editReply({ content: "❌ Du darfst dieses Ticket nicht verwalten." }).catch(() => null);
+          return;
+        }
+
+        const target = interaction.options.getUser("user", true);
+        await unmarkTicketUserRemoved(interaction.channel.id, target.id).catch(() => null);
+
+        try {
+          await interaction.channel.members.add(target.id);
+          await interaction.editReply({ content: `➕ <@${interaction.user.id}> hat ${target} zum Ticket hinzugefügt.` });
+        } catch (err) {
           console.error(`❌ Konnte ${target.tag} nicht zum Ticket hinzufügen:`, err?.message || err);
-        });
-        await interaction.reply({ content: `➕ <@${interaction.user.id}> hat ${target} zum Ticket hinzugefügt.` });
+          await interaction.editReply({ content: `❌ ${target} konnte nicht hinzugefügt werden. Prüfe Bot-Rechte und ob der User existiert.` }).catch(() => null);
+        }
         return;
       }
 
       if (interaction.commandName === "ticket-remove") {
-        const ticket = await ensureTicketThread(interaction);
-        if (!ticket) return;
-        if (!canUseTicketStaffCommands(interaction.member, ticket.category)) {
-          return interaction.reply({ content: "❌ Du darfst dieses Ticket nicht verwalten.", ephemeral: true });
-        }
-        const target = interaction.options.getUser("user");
-        if (target.id === ticket.opener_id) {
-          return interaction.reply({ content: "❌ Der Ticket-Ersteller kann nicht aus seinem eigenen Ticket entfernt werden.", ephemeral: true });
-        }
-        // Wichtig: Erst blockieren, dann entfernen. So kann kein späterer Auto-Add den User erneut reinholen.
-        await markTicketUserRemoved(interaction.channel.id, target.id, interaction.user.id);
-        await forceRemoveTicketMember(interaction.channel, target.id, `Dauerhaft aus Ticket entfernt von ${interaction.user.tag}`);
+        await interaction.deferReply({ ephemeral: false }).catch(() => null);
 
-        await interaction.reply({
+        if (!interaction.channel?.isThread?.()) {
+          await interaction.editReply({ content: "❌ Dieser Command kann nur in einem Ticket-Thread genutzt werden." }).catch(() => null);
+          return;
+        }
+
+        const ticket = await getOrRecoverTicketFromThread(interaction.channel);
+        if (!ticket) {
+          await interaction.editReply({ content: "❌ Dieser Thread ist kein bekanntes Ticket." }).catch(() => null);
+          return;
+        }
+
+        if (!canUseTicketStaffCommands(interaction.member, ticket.category)) {
+          await interaction.editReply({ content: "❌ Du darfst dieses Ticket nicht verwalten." }).catch(() => null);
+          return;
+        }
+
+        const target = interaction.options.getUser("user", true);
+        if (target.id === ticket.opener_id) {
+          await interaction.editReply({ content: "❌ Der Ticket-Ersteller kann nicht aus seinem eigenen Ticket entfernt werden." }).catch(() => null);
+          return;
+        }
+
+        await markTicketUserRemoved(interaction.channel.id, target.id, interaction.user.id).catch((err) => {
+          console.error("❌ Remove-Blocklist konnte nicht gespeichert werden:", err?.message || err);
+        });
+
+        await forceRemoveTicketMember(interaction.channel, target.id, `Dauerhaft aus Ticket entfernt von ${interaction.user.tag}`);
+        await interaction.editReply({
           content:
             `➖ <@${interaction.user.id}> hat ${target} dauerhaft aus dem Ticket entfernt. ` +
             `Er wird nicht automatisch wieder hinzugefügt.`,
-        });
+        }).catch(() => null);
 
         await sendTicketDebugLog(
           `🧹 **Ticket-Remove gesetzt**
@@ -3655,11 +3815,13 @@ client.on("interactionCreate", async (interaction) => {
         ).catch((err) => console.error("❌ Ticket-Open DB-Update fehlgeschlagen:", err));
 
         await thread.send({
-          content: `🔓 ・TICKET WIEDER GEÖFFNET\n\n<@${interaction.user.id}> hat dieses Ticket wieder geöffnet.`,
-          allowedMentions: { users: [interaction.user.id] },
+          content: `@everyone\n\n🔓 ・TICKET WIEDER GEÖFFNET\n\n<@${interaction.user.id}> hat dieses Ticket wieder geöffnet.`,
+          allowedMentions: { parse: ["everyone"], users: [interaction.user.id] },
         }).catch(() => null);
 
-        await interaction.editReply({ content: `🔓 <@${interaction.user.id}> hat das Ticket wieder geöffnet.` });
+        scheduleTicketStaffAutoAdd(thread.id, ticket.category, 1000);
+
+        await interaction.editReply({ content: `🔓 <@${interaction.user.id}> hat das Ticket wieder geöffnet. Teammitglieder werden im Hintergrund erneut hinzugefügt.` });
         return;
       }
 
