@@ -1602,65 +1602,94 @@ async function archiveTicketForDeletion(thread, ticket, actorId, reasonText) {
 }
 
 async function handleTicketCloseDecision(interaction, closeToken, decision) {
-  // Sofort bestätigen, damit die Buttons niemals bei "Anwendung reagiert nicht" hängen bleiben.
+  // Sofort bestätigen, damit der Button nie bei "lädt" hängen bleibt.
   await interaction.deferUpdate().catch(() => null);
 
-  const ticket = await getTicketFromCloseToken(closeToken);
-  if (!ticket) {
-    await interaction.followUp({ content: "❌ Ticket wurde nicht gefunden.", ephemeral: true }).catch(() => null);
-    return;
+  try {
+    const ticket = await getTicketFromCloseToken(closeToken);
+    if (!ticket) {
+      await interaction.followUp({ content: "❌ Ticket wurde nicht gefunden.", ephemeral: true }).catch(() => null);
+      return;
+    }
+
+    const thread = interaction.channel?.isThread?.()
+      ? interaction.channel
+      : await client.channels.fetch(ticket.thread_id).catch(() => null);
+
+    if (!thread) {
+      await interaction.followUp({ content: "❌ Der Ticket-Thread wurde nicht gefunden.", ephemeral: true }).catch(() => null);
+      return;
+    }
+
+    const memberCanManage = interaction.member && canUseTicketStaffCommands(interaction.member, ticket.category);
+    const isTicketOpener = interaction.user.id === ticket.opener_id;
+
+    if (!isTicketOpener && !memberCanManage) {
+      await interaction.followUp({
+        content: "❌ Nur der Ticket-Ersteller oder berechtigte Teammitglieder dürfen diese Schließung bestätigen oder abbrechen.",
+        ephemeral: true,
+      }).catch(() => null);
+      return;
+    }
+
+    // Buttons deaktivieren, aber falls Discord das Edit blockt, läuft der Rest trotzdem weiter.
+    await interaction.message.edit({ components: disableActionRows(interaction.message.components) }).catch((err) => {
+      console.error("⚠️ Ticket-Close-Buttons konnten nicht deaktiviert werden:", err?.message || err);
+    });
+
+    if (decision === "confirm") {
+      await archiveTicketForDeletion(thread, ticket, interaction.user.id, "Das Ticket wurde bestätigt geschlossen.");
+      return;
+    }
+
+    const restoreName = getRestoreTicketName(ticket);
+
+    await thread.setName(restoreName, `Schließung abgebrochen von ${interaction.user.tag}`).catch((err) => {
+      console.error("❌ Ticket konnte nach Abbruch nicht zurückbenannt werden:", err?.message || err);
+    });
+
+    await query(
+      `
+      UPDATE ticket_records
+      SET status = 'open',
+          current_name = $2,
+          close_requested_by = NULL,
+          close_requested_at = NULL,
+          close_deadline_at = NULL,
+          close_message_id = NULL,
+          delete_after_at = NULL,
+          updated_at = NOW()
+      WHERE thread_id = $1;
+      `,
+      [ticket.thread_id, restoreName]
+    ).catch((err) => console.error("❌ Ticket-Cancel DB-Update fehlgeschlagen:", err));
+
+    await thread.send({
+      content:
+        `@everyone\n\n` +
+        `❌ ・SCHLIESSUNG ABGEBROCHEN\n\n` +
+        `<@${interaction.user.id}> hat die Schließungsanfrage abgebrochen.\n\n` +
+        `📌 Status: **Offen**\n` +
+        `Das Ticket kann wieder normal bearbeitet und später erneut geschlossen werden.`,
+      allowedMentions: {
+        parse: ["everyone"],
+        users: [interaction.user.id],
+      },
+    }).catch(async (err) => {
+      console.error("❌ Abbruch-Nachricht konnte nicht gesendet werden:", err?.message || err);
+      await interaction.followUp({
+        content: "⚠️ Die Schließung wurde abgebrochen, aber die Nachricht konnte nicht in den Thread gesendet werden. Prüfe die Bot-Rechte.",
+        ephemeral: true,
+      }).catch(() => null);
+    });
+  } catch (err) {
+    console.error("❌ Fehler bei Ticket-Schließungsentscheidung:", err);
+    await interaction.followUp({
+      content: "❌ Beim Verarbeiten der Schließungsentscheidung ist ein Fehler passiert. Schau bitte in die Railway Logs.",
+      ephemeral: true,
+    }).catch(() => null);
   }
-
-  if (interaction.user.id !== ticket.opener_id) {
-    await interaction.followUp({ content: "❌ Nur der Ticket-Ersteller darf diese Schließung bestätigen oder abbrechen.", ephemeral: true }).catch(() => null);
-    return;
-  }
-
-  const thread = interaction.channel?.isThread?.() ? interaction.channel : await client.channels.fetch(ticket.thread_id).catch(() => null);
-  if (!thread) {
-    await interaction.followUp({ content: "❌ Der Ticket-Thread wurde nicht gefunden.", ephemeral: true }).catch(() => null);
-    return;
-  }
-
-  await interaction.message.edit({ components: disableActionRows(interaction.message.components) }).catch(() => null);
-
-  if (decision === "confirm") {
-    await archiveTicketForDeletion(thread, ticket, interaction.user.id, "Das Ticket wurde vom Ticket-Ersteller bestätigt geschlossen.");
-    return;
-  }
-
-  const restoreName = getRestoreTicketName(ticket);
-
-  await thread.setName(restoreName, `Schließung abgebrochen von ${interaction.user.tag}`).catch((err) => {
-    console.error("❌ Ticket konnte nach Abbruch nicht zurückbenannt werden:", err?.message || err);
-  });
-
-  await query(
-    `
-    UPDATE ticket_records
-    SET status = 'open',
-        current_name = $2,
-        close_requested_by = NULL,
-        close_requested_at = NULL,
-        close_deadline_at = NULL,
-        close_message_id = NULL,
-        delete_after_at = NULL,
-        updated_at = NOW()
-    WHERE thread_id = $1;
-    `,
-    [ticket.thread_id, restoreName]
-  ).catch((err) => console.error("❌ Ticket-Cancel DB-Update fehlgeschlagen:", err));
-
-  const ping = getTicketActorPing(ticket);
-  await thread.send({
-    content:
-      `❌ ・SCHLIESSUNG ABGEBROCHEN\n\n` +
-      `<@${interaction.user.id}> hat die Schließungsanfrage abgelehnt.\n\n` +
-      `Das Ticket bleibt geöffnet.${ping ? ` ${ping} wurde benachrichtigt.` : ""}`,
-    allowedMentions: { users: [interaction.user.id, ticket.claimed_by, ticket.close_requested_by].filter(Boolean) },
-  }).catch(() => null);
 }
-
 async function checkTicketCloseDeadlines() {
   const expiredRequests = await query(
     `
