@@ -97,6 +97,7 @@ const ACTIVE_STANDS_CHANNEL_ID = "1512314177396543581";
 const PERSONAL_FILES_CHANNEL_ID = "1512314182299816049";
 const STATISTICS_WEEKLY_CHANNEL_ID = "1512314182299816050";
 const MANAGER_CHAT_CHANNEL_ID = "1512314181259366547";
+const STOCK_CHECK_REMINDER_CHANNEL_ID = "1512314181259366549";
 const TICKET_DEBUG_CHANNEL_ID = "1512779121170714695";
 
 const BOOKING_REQUEST_CHANNEL_ID = "1512409329771221075";
@@ -3446,8 +3447,11 @@ async function sendStockCheckReminderIfNeeded(force = false) {
     if (diffDays < 2) return;
   }
 
-  const channel = await client.channels.fetch(MANAGER_CHAT_CHANNEL_ID).catch(() => null);
-  if (!channel) return;
+  const channel = await client.channels.fetch(STOCK_CHECK_REMINDER_CHANNEL_ID).catch(() => null);
+  if (!channel) {
+    console.error("❌ Lagerprüfungs-Channel wurde nicht gefunden:", STOCK_CHECK_REMINDER_CHANNEL_ID);
+    return;
+  }
 
   const embed = new EmbedBuilder()
     .setColor(0x5dade2)
