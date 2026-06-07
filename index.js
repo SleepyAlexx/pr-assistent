@@ -1460,9 +1460,23 @@ async function claimTicket(interaction) {
   await interaction.editReply({ embeds: [embed] });
 }
 
+async function ticketTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} Timeout nach ${Math.round(ms / 1000)} Sekunden`)), ms);
+  });
+
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function requestTicketClose(interaction) {
-  // Sofort bestätigen, damit Discord nicht dauerhaft lädt.
+  // Wichtig: Sofort antworten, damit Discord nicht dauerhaft "denkt nach..." zeigt.
   await interaction.deferReply({ ephemeral: true }).catch(() => null);
+  await interaction.editReply({ content: "⏳ Schließungsanfrage wird vorbereitet..." }).catch(() => null);
 
   try {
     if (!interaction.channel?.isThread?.()) {
@@ -1472,13 +1486,18 @@ async function requestTicketClose(interaction) {
     }
 
     const thread = interaction.channel;
+    console.log(`🔒 Ticket-Close gestartet: ${thread.name} (${thread.id}) von ${interaction.user.tag}`);
 
-    const ticket = await getOrRecoverTicketFromThread(thread);
+    const ticket = await ticketTimeout(getOrRecoverTicketFromThread(thread), 7000, "Ticket-Daten laden").catch((err) => {
+      console.error("❌ Ticket-Daten konnten bei /ticket-close nicht geladen werden:", err);
+      return null;
+    });
+
     if (!ticket) {
       return interaction.editReply({
         content:
-          "❌ Dieser Thread ist kein bekanntes Ticket. " +
-          "Bitte nutze den Command nur in Tickets, die über das Ticketpanel erstellt wurden.",
+          "❌ Dieses Ticket konnte nicht aus der Datenbank geladen werden. " +
+          "Bitte prüfe Railway/PostgreSQL und versuche es erneut.",
       }).catch(() => null);
     }
 
@@ -1497,11 +1516,15 @@ async function requestTicketClose(interaction) {
     const deadline = new Date(Date.now() + TICKET_CLOSE_AFTER_MS);
     const closingName = getClosingTicketName(ticket);
 
-    try {
-      await thread.setName(closingName, `Schließungsanfrage von ${interaction.user.tag}`);
-    } catch (err) {
+    await interaction.editReply({ content: "⏳ Ticket wird auf Schließung gesetzt..." }).catch(() => null);
+
+    await ticketTimeout(
+      thread.setName(closingName, `Schließungsanfrage von ${interaction.user.tag}`),
+      7000,
+      "Threadname ändern"
+    ).catch((err) => {
       console.error("❌ Ticket konnte für Schließung nicht umbenannt werden:", err);
-    }
+    });
 
     const embed = new EmbedBuilder()
       .setColor(0xe67e22)
@@ -1517,16 +1540,23 @@ async function requestTicketClose(interaction) {
 
     let msg = null;
 
-    try {
-      msg = await thread.send({
+    await interaction.editReply({ content: "⏳ Schließungsnachricht wird gesendet..." }).catch(() => null);
+
+    msg = await ticketTimeout(
+      thread.send({
         content: `<@${ticket.opener_id}>`,
         embeds: [embed],
         components: [ticketCloseButtons(thread.id)],
         allowedMentions: { users: [ticket.opener_id] },
-      });
-    } catch (err) {
+      }),
+      10000,
+      "Schließungsnachricht senden"
+    ).catch((err) => {
       console.error("❌ Schließungsnachricht konnte nicht gesendet werden:", err);
+      return null;
+    });
 
+    if (!msg) {
       return interaction.editReply({
         content:
           "❌ Die Schließungsanfrage konnte nicht gesendet werden. " +
@@ -1534,21 +1564,27 @@ async function requestTicketClose(interaction) {
       }).catch(() => null);
     }
 
-    await query(
-      `
-      UPDATE ticket_records
-      SET status = 'closing_requested',
-          close_requested_by = $2,
-          close_requested_at = NOW(),
-          close_deadline_at = $3,
-          close_message_id = $4,
-          updated_at = NOW()
-      WHERE thread_id = $1;
-      `,
-      [thread.id, interaction.user.id, deadline, msg.id]
+    await ticketTimeout(
+      query(
+        `
+        UPDATE ticket_records
+        SET status = 'closing_requested',
+            close_requested_by = $2,
+            close_requested_at = NOW(),
+            close_deadline_at = $3,
+            close_message_id = $4,
+            updated_at = NOW()
+        WHERE thread_id = $1;
+        `,
+        [thread.id, interaction.user.id, deadline, msg.id]
+      ),
+      7000,
+      "Ticket-Close DB-Update"
     ).catch((err) => {
       console.error("❌ Ticket-Close DB-Update fehlgeschlagen:", err);
     });
+
+    console.log(`✅ Ticket-Close erfolgreich gestartet: ${thread.id}`);
 
     return interaction.editReply({
       content: "✅ Schließungsanfrage wurde gestellt.",
