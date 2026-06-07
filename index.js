@@ -1680,12 +1680,88 @@ async function fetchTicketThreadForOpen(threadId, categoryKey = null) {
   return null;
 }
 
+function waitMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchFreshTicketThread(threadId, categoryKey = null) {
+  const thread = await fetchTicketThreadForOpen(threadId, categoryKey).catch((err) => {
+    console.error("⚠️ Ticket-Open: Thread konnte nicht frisch geladen werden:", err?.message || err);
+    return null;
+  });
+
+  return thread?.isThread?.() ? thread : null;
+}
+
+async function forceOpenTicketThread(threadId, categoryKey, restoreName, actorId) {
+  let thread = await fetchFreshTicketThread(threadId, categoryKey);
+
+  if (!thread) {
+    console.error("❌ Ticket-Open: Thread nicht gefunden:", threadId);
+    return null;
+  }
+
+  const reason = `Ticket wieder geöffnet von ${actorId}`;
+  const safeName = String(restoreName || thread.name || "ticket").replace(/^closed-+/i, "").slice(0, 95);
+
+  // Bei Discord können locked + archived Threads zickig sein.
+  // Deshalb öffnen wir den Thread mehrfach und in mehreren kleinen Schritten.
+  const steps = [
+    {
+      label: "Thread entsperren 1",
+      run: () => thread.edit({ locked: false }, reason),
+    },
+    {
+      label: "Thread entarchivieren 1",
+      run: () => thread.edit({ archived: false }, reason),
+    },
+    {
+      label: "Thread entsperren/entarchivieren 2",
+      run: () => thread.edit({ locked: false, archived: false }, reason),
+    },
+    {
+      label: "Thread Namen zurücksetzen",
+      run: () => thread.edit({ name: safeName, locked: false, archived: false }, reason),
+    },
+  ];
+
+  for (const step of steps) {
+    await ticketTimeout(step.run(), 10000, step.label).catch((err) => {
+      console.error(`⚠️ Ticket-Open Schritt fehlgeschlagen (${step.label}):`, err?.message || err);
+    });
+
+    await waitMs(900);
+    thread = (await fetchFreshTicketThread(threadId, categoryKey)) || thread;
+  }
+
+  // Finaler Sicherheitsversuch nach kurzer Wartezeit.
+  await waitMs(1800);
+  thread = (await fetchFreshTicketThread(threadId, categoryKey)) || thread;
+
+  await ticketTimeout(
+    thread.edit({ locked: false, archived: false, name: safeName }, reason),
+    10000,
+    "Thread final öffnen"
+  ).catch((err) => {
+    console.error("⚠️ Ticket-Open finaler Öffnungsversuch fehlgeschlagen:", err?.message || err);
+  });
+
+  await waitMs(1200);
+  thread = (await fetchFreshTicketThread(threadId, categoryKey)) || thread;
+
+  console.log(
+    `🔎 Ticket-Open Status nach Öffnen: thread=${threadId} archived=${thread.archived} locked=${thread.locked} name=${thread.name}`
+  );
+
+  return thread;
+}
+
 function scheduleTicketOpenFinalization(threadId, ticket, actorId, restoreName) {
   setTimeout(async () => {
     console.log(`🔓 Ticket-Open-Finalisierung gestartet: ${threadId}`);
 
-    const thread = await fetchTicketThreadForOpen(threadId, ticket?.category).catch((err) => {
-      console.error("❌ Ticket-Open-Finalisierung: Thread konnte nicht geladen werden:", err?.message || err);
+    const thread = await forceOpenTicketThread(threadId, ticket?.category, restoreName, actorId).catch((err) => {
+      console.error("❌ Ticket-Open-Finalisierung fehlgeschlagen:", err?.message || err);
       return null;
     });
 
@@ -1694,30 +1770,29 @@ function scheduleTicketOpenFinalization(threadId, ticket, actorId, restoreName) 
       return;
     }
 
-    await ticketTimeout(thread.setArchived(false, "Ticket wieder geöffnet"), 8000, "Ticket entarchivieren").catch((err) => {
-      console.error("⚠️ Ticket-Open: Entarchivieren fehlgeschlagen:", err?.message || err);
-    });
-
-    await ticketTimeout(thread.setLocked(false, "Ticket wieder geöffnet"), 8000, "Ticket entsperren").catch((err) => {
-      console.error("⚠️ Ticket-Open: Entsperren fehlgeschlagen:", err?.message || err);
-    });
-
     await ticketTimeout(
       thread.send({
         content:
           `@everyone\n\n` +
           `🔓 ・**TICKET WIEDER GEÖFFNET**\n\n` +
-          `<@${actorId}> hat dieses Ticket wieder geöffnet.`,
+          `<@${actorId}> hat dieses Ticket wieder geöffnet.\n\n` +
+          `✅ Status: **Offen**`,
         allowedMentions: { parse: ["everyone"], users: [actorId] },
       }),
-      8000,
+      10000,
       "Ticket-Open Nachricht senden"
     ).catch((err) => {
       console.error("⚠️ Ticket-Open: Öffentliche Nachricht konnte nicht gesendet werden:", err?.message || err);
     });
 
-    safeThreadRename(thread, restoreName, `Ticket wieder geöffnet von ${actorId}`, "Ticket beim Öffnen umbenennen");
     scheduleTicketStaffAutoAdd(thread.id, ticket.category, 1200);
+
+    // Noch einmal nachziehen, falls Discord nach dem Senden wieder langsam aktualisiert.
+    setTimeout(() => {
+      forceOpenTicketThread(threadId, ticket?.category, restoreName, actorId).catch((err) => {
+        console.error("⚠️ Ticket-Open Nachzieh-Fix fehlgeschlagen:", err?.message || err);
+      });
+    }, 5000);
 
     console.log(`✅ Ticket-Open-Finalisierung beendet: ${threadId}`);
   }, 300);
