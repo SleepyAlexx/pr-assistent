@@ -923,6 +923,12 @@ const TICKET_MANAGEMENT_ROLE_IDS = [
   "1512314173936238658",
 ];
 
+// Sonderzugriff: Essensstand- und Event-Tickets sind nur für diese zwei Leitungsrollen sichtbar.
+const TICKET_RESTRICTED_EVENT_ROLE_IDS = [
+  "1512314174045294605",
+  "1512314174045294604",
+];
+
 // Diese Rollen werden bei jedem neuen Ticket automatisch aktiv zum Thread hinzugefügt.
 const TICKET_AUTO_ADD_ROLE_IDS = [
   "1512314174045294606",
@@ -983,8 +989,22 @@ function memberTicketName(member, user) {
 }
 
 function categoryRoles(categoryKey) {
+  // Essensstand- und Event-Tickets dürfen nur von den zwei angegebenen Rollen gesehen/verwaltet werden.
+  if (categoryKey === "essensstand" || categoryKey === "event") {
+    return TICKET_RESTRICTED_EVENT_ROLE_IDS;
+  }
+
   const category = TICKET_CATEGORIES[categoryKey];
   return category?.access === "management" ? TICKET_MANAGEMENT_ROLE_IDS : TICKET_STAFF_ROLE_IDS;
+}
+
+function ticketAutoAddRoles(categoryKey) {
+  // Bei Essensstand und Event werden automatisch nur diese zwei Rollen in den privaten Thread eingeladen.
+  if (categoryKey === "essensstand" || categoryKey === "event") {
+    return TICKET_RESTRICTED_EVENT_ROLE_IDS;
+  }
+
+  return TICKET_AUTO_ADD_ROLE_IDS;
 }
 
 function detectTicketCategoryFromName(name = "") {
@@ -1259,7 +1279,7 @@ async function addAllowedStaffToThread(thread, categoryKey) {
     console.error("⚠️ Bot konnte dem Ticket-Thread nicht beitreten:", err?.message || err);
   });
 
-  const allowedRoles = TICKET_AUTO_ADD_ROLE_IDS;
+  const allowedRoles = ticketAutoAddRoles(categoryKey);
   const removedUserIds = await getRemovedTicketUserIds(thread.id);
   const fetchResult = await fetchAllGuildMembersForTickets(guild);
   const members = fetchResult.members;
