@@ -1602,34 +1602,47 @@ async function archiveTicketForDeletion(thread, ticket, actorId, reasonText) {
 }
 
 async function handleTicketCloseDecision(interaction, closeToken, decision) {
-  // Sofort bestätigen, damit der Button nie bei "lädt" hängen bleibt.
-  await interaction.deferUpdate().catch(() => null);
+  // Wichtig: Bei Buttons sofort sichtbar antworten.
+  // So sieht man nicht mehr "es passiert nichts", sondern bekommt direkt Feedback.
+  await interaction.deferReply({ ephemeral: true }).catch(() => null);
 
   try {
-    const ticket = await getTicketFromCloseToken(closeToken);
-    if (!ticket) {
-      await interaction.followUp({ content: "❌ Ticket wurde nicht gefunden.", ephemeral: true }).catch(() => null);
-      return;
+    let thread = interaction.channel?.isThread?.()
+      ? interaction.channel
+      : await client.channels.fetch(closeToken).catch(() => null);
+
+    let ticket = await getTicketFromCloseToken(closeToken);
+
+    // Fallback: Falls die DB den Token nicht findet, Ticket aus dem aktuellen Thread wiederherstellen.
+    // Das verhindert, dass alte Close-Buttons hängen bleiben.
+    if (!ticket && thread?.isThread?.()) {
+      ticket = await getOrRecoverTicketFromThread(thread);
     }
 
-    const thread = interaction.channel?.isThread?.()
-      ? interaction.channel
-      : await client.channels.fetch(ticket.thread_id).catch(() => null);
+    // Fallback 2: Wenn der Thread noch nicht geladen ist, aber die DB das Ticket kennt.
+    if (!thread && ticket?.thread_id) {
+      thread = await client.channels.fetch(ticket.thread_id).catch(() => null);
+    }
 
     if (!thread) {
-      await interaction.followUp({ content: "❌ Der Ticket-Thread wurde nicht gefunden.", ephemeral: true }).catch(() => null);
-      return;
+      return interaction.editReply({
+        content: "❌ Der Ticket-Thread wurde nicht gefunden. Prüfe bitte, ob der Thread noch existiert.",
+      }).catch(() => null);
+    }
+
+    if (!ticket) {
+      return interaction.editReply({
+        content: "❌ Ticket wurde in der Datenbank nicht gefunden. Ich konnte den Button deshalb nicht verarbeiten.",
+      }).catch(() => null);
     }
 
     const memberCanManage = interaction.member && canUseTicketStaffCommands(interaction.member, ticket.category);
     const isTicketOpener = interaction.user.id === ticket.opener_id;
 
     if (!isTicketOpener && !memberCanManage) {
-      await interaction.followUp({
+      return interaction.editReply({
         content: "❌ Nur der Ticket-Ersteller oder berechtigte Teammitglieder dürfen diese Schließung bestätigen oder abbrechen.",
-        ephemeral: true,
       }).catch(() => null);
-      return;
     }
 
     // Buttons deaktivieren, aber falls Discord das Edit blockt, läuft der Rest trotzdem weiter.
@@ -1638,11 +1651,15 @@ async function handleTicketCloseDecision(interaction, closeToken, decision) {
     });
 
     if (decision === "confirm") {
+      await interaction.editReply({ content: "🔒 Ticket wird geschlossen..." }).catch(() => null);
       await archiveTicketForDeletion(thread, ticket, interaction.user.id, "Das Ticket wurde bestätigt geschlossen.");
       return;
     }
 
     const restoreName = getRestoreTicketName(ticket);
+
+    await thread.setArchived(false, "Schließung abgebrochen").catch(() => null);
+    await thread.setLocked(false, "Schließung abgebrochen").catch(() => null);
 
     await thread.setName(restoreName, `Schließung abgebrochen von ${interaction.user.tag}`).catch((err) => {
       console.error("❌ Ticket konnte nach Abbruch nicht zurückbenannt werden:", err?.message || err);
@@ -1661,7 +1678,7 @@ async function handleTicketCloseDecision(interaction, closeToken, decision) {
           updated_at = NOW()
       WHERE thread_id = $1;
       `,
-      [ticket.thread_id, restoreName]
+      [ticket.thread_id || thread.id, restoreName]
     ).catch((err) => console.error("❌ Ticket-Cancel DB-Update fehlgeschlagen:", err));
 
     await thread.send({
@@ -1677,19 +1694,23 @@ async function handleTicketCloseDecision(interaction, closeToken, decision) {
       },
     }).catch(async (err) => {
       console.error("❌ Abbruch-Nachricht konnte nicht gesendet werden:", err?.message || err);
-      await interaction.followUp({
-        content: "⚠️ Die Schließung wurde abgebrochen, aber die Nachricht konnte nicht in den Thread gesendet werden. Prüfe die Bot-Rechte.",
-        ephemeral: true,
+      await interaction.editReply({
+        content: "⚠️ Status wurde zurückgesetzt, aber die Nachricht konnte nicht in den Thread gesendet werden. Prüfe die Bot-Rechte.",
       }).catch(() => null);
+      return;
     });
+
+    return interaction.editReply({
+      content: "✅ Schließungsanfrage wurde abgebrochen. Das Ticket ist wieder offen.",
+    }).catch(() => null);
   } catch (err) {
     console.error("❌ Fehler bei Ticket-Schließungsentscheidung:", err);
-    await interaction.followUp({
+    return interaction.editReply({
       content: "❌ Beim Verarbeiten der Schließungsentscheidung ist ein Fehler passiert. Schau bitte in die Railway Logs.",
-      ephemeral: true,
     }).catch(() => null);
   }
 }
+
 async function checkTicketCloseDeadlines() {
   const expiredRequests = await query(
     `
