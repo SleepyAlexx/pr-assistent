@@ -7,6 +7,7 @@
 // Update: Ticket-System final stabilisiert: Private Threads, Strict Remove, stabiles Rename/Close, Bürgerrollen blockiert.
 // Update: Geschlossene Tickets werden gelockt/archiviert und nach 2 Tagen automatisch gelöscht.
 // Wichtig: DISCORD_TOKEN, CLIENT_ID, GUILD_ID und DATABASE_URL in der .env eintragen.
+// Update: Business-Zeitlogs werden beim Ausstempeln automatisch in Wochenzeit/Gesamtzeit übernommen.
 
 if (process.env.NODE_ENV !== "production") require("dotenv").config();
 
@@ -411,6 +412,20 @@ async function initDatabase() {
       linked_by TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  // Verhindert, dass ein Ausstempel-Log mehrfach gezählt wird.
+  await query(`
+    CREATE TABLE IF NOT EXISTS business_time_imports (
+      message_id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      business_id TEXT,
+      duration_minutes INTEGER NOT NULL,
+      duration_text TEXT,
+      raw_text TEXT,
+      imported_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
 
@@ -3940,6 +3955,87 @@ function parseBusinessTimeLogMessage(message) {
   };
 }
 
+async function importBusinessTimeFromLog(parsed, linkedUser) {
+  if (!parsed || !linkedUser) return { ok: false, reason: "missing_data" };
+
+  if (parsed.action !== "ausgestempelt") {
+    return { ok: false, reason: "not_clock_out" };
+  }
+
+  const minutes = Number(parsed.durationMinutes || 0);
+  if (!Number.isFinite(minutes) || minutes <= 0) {
+    return { ok: false, reason: "invalid_duration" };
+  }
+
+  const db = await pool.connect();
+
+  try {
+    await db.query("BEGIN");
+
+    // Erst Import-ID eintragen. Wenn die Message schon verarbeitet wurde, wird nichts doppelt gezählt.
+    const importRes = await db.query(
+      `
+      INSERT INTO business_time_imports (message_id, user_id, name, business_id, duration_minutes, duration_text, raw_text)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      ON CONFLICT (message_id) DO NOTHING
+      RETURNING message_id;
+      `,
+      [
+        parsed.messageId,
+        linkedUser.user_id,
+        parsed.employeeName,
+        parsed.businessId,
+        minutes,
+        parsed.durationText,
+        parsed.rawText,
+      ]
+    );
+
+    if (importRes.rowCount === 0) {
+      await db.query("ROLLBACK");
+      return { ok: false, reason: "already_imported" };
+    }
+
+    await db.query(
+      `
+      INSERT INTO employees (user_id, total_minutes, weekly_minutes, left_server)
+      VALUES ($1, $2, $2, FALSE)
+      ON CONFLICT (user_id)
+      DO UPDATE SET
+        total_minutes = employees.total_minutes + EXCLUDED.total_minutes,
+        weekly_minutes = employees.weekly_minutes + EXCLUDED.weekly_minutes,
+        left_server = FALSE;
+      `,
+      [linkedUser.user_id, minutes]
+    );
+
+    await db.query(
+      `
+      INSERT INTO work_sessions (user_id, started_at, ended_at, minutes, auto_clockout, corrected)
+      VALUES ($1, NOW() - ($2::int * INTERVAL '1 minute'), NOW(), $2, FALSE, TRUE);
+      `,
+      [linkedUser.user_id, minutes]
+    );
+
+    await db.query("COMMIT");
+
+    console.log("✅ Business-Zeit automatisch eingetragen:", {
+      name: parsed.employeeName,
+      userId: linkedUser.user_id,
+      minutes,
+      messageId: parsed.messageId,
+    });
+
+    return { ok: true, minutes };
+  } catch (err) {
+    await db.query("ROLLBACK").catch(() => null);
+    console.error("❌ Business-Zeit konnte nicht importiert werden:", err);
+    return { ok: false, reason: "db_error", error: err };
+  } finally {
+    db.release();
+  }
+}
+
 client.on("messageCreate", async (message) => {
   try {
     if (!message.guildId || message.channelId !== BUSINESS_TIME_LOG_CHANNEL_ID) return;
@@ -3976,10 +4072,22 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
-    // Schritt 3 ist nur die Verknüpfung. Zeiten werden noch NICHT automatisch eingetragen.
-    // Das machen wir erst im nächsten Schritt, sobald die Links sauber getestet wurden.
+    if (parsed.action !== "ausgestempelt") {
+      console.log(`ℹ️ ${parsed.employeeName} hat sich eingestempelt. Zeit wird erst beim Ausstempeln übernommen.`);
+      return;
+    }
+
+    const importResult = await importBusinessTimeFromLog(parsed, linkedUser);
+
+    if (importResult.ok) {
+      await updateTotalWorktimeMessage().catch((err) => console.error("⚠️ Gesamtzeit konnte nach Business-Import nicht aktualisiert werden:", err));
+      await updateWeeklyWorktimeMessage().catch((err) => console.error("⚠️ Wochenzeit konnte nach Business-Import nicht aktualisiert werden:", err));
+      await updateDashboardMessage().catch((err) => console.error("⚠️ Dashboard konnte nach Business-Import nicht aktualisiert werden:", err));
+    } else {
+      console.log("ℹ️ Business-Zeit wurde nicht eingetragen:", importResult.reason);
+    }
   } catch (err) {
-    console.error("❌ Fehler beim Business-Zeitlog-Testscanner:", err);
+    console.error("❌ Fehler beim Business-Zeitlog-Scanner:", err);
   }
 });
 
