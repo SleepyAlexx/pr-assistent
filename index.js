@@ -1702,6 +1702,13 @@ async function fetchFreshTicketThread(threadId, categoryKey = null) {
 
 async function forceRenameOpenTicketThread(threadId, categoryKey, safeName, actorId, attempt = 1) {
   const reason = `Ticketname nach Öffnung zurückgesetzt von ${actorId}`;
+  const cleanName = stripTicketStatusPrefixes(safeName || "ticket").slice(0, 95);
+
+  if (!cleanName || cleanName.length < 2) {
+    console.error(`⚠️ Ticket-Open Rename Versuch ${attempt}: ungültiger Zielname`, cleanName);
+    return false;
+  }
+
   const thread = await fetchFreshTicketThread(threadId, categoryKey);
 
   if (!thread?.isThread?.()) {
@@ -1710,19 +1717,46 @@ async function forceRenameOpenTicketThread(threadId, categoryKey, safeName, acto
   }
 
   try {
-    // Ganz wichtig: erst wirklich offen/entsperrt halten, dann Name setzen.
+    // 1) Thread erst sicher offen/entsperrt halten.
     await ticketTimeout(
-      thread.edit({ archived: false, locked: false, name: safeName }, reason),
-      9000,
-      `Ticket-Open Titel ändern Versuch ${attempt}`
+      thread.edit({ archived: false, locked: false }, reason),
+      7000,
+      `Ticket-Open freigeben vor Rename Versuch ${attempt}`
+    ).catch((err) => {
+      console.error(`⚠️ Ticket-Open Freigabe vor Rename Versuch ${attempt} fehlgeschlagen:`, err?.message || err);
+    });
+
+    await waitMs(400);
+
+    // 2) Rename über den normalen Discord.js Weg.
+    await ticketTimeout(
+      thread.setName(cleanName, reason),
+      8000,
+      `Ticket-Open setName Versuch ${attempt}`
     );
+
+    // 3) Frisch laden und prüfen, ob Discord den Namen wirklich übernommen hat.
+    const fresh = await fetchFreshTicketThread(threadId, categoryKey).catch(() => null);
+    const freshName = fresh?.name || thread.name;
+
+    if (freshName !== cleanName) {
+      console.error(`⚠️ Ticket-Open Rename Versuch ${attempt}: Name noch nicht übernommen (${freshName} != ${cleanName}). Erzwinge REST-Rename...`);
+
+      // 4) Fallback direkt über REST. Das ist bei Threads oft zuverlässiger, wenn setName hängen bleibt oder Discord cached.
+      await ticketTimeout(
+        client.rest.patch(Routes.channel(threadId), { body: { name: cleanName } }),
+        8000,
+        `Ticket-Open REST-Rename Versuch ${attempt}`
+      );
+    }
 
     await query(
       `UPDATE ticket_records SET current_name = $2, updated_at = NOW() WHERE thread_id = $1`,
-      [threadId, safeName]
+      [threadId, cleanName]
     ).catch((err) => console.error("⚠️ Ticket-Open Rename DB-Update fehlgeschlagen:", err?.message || err));
 
-    console.log(`✅ Ticket-Open Titel geändert: ${threadId} -> ${safeName}`);
+    const check = await fetchFreshTicketThread(threadId, categoryKey).catch(() => null);
+    console.log(`✅ Ticket-Open Titel geändert Versuch ${attempt}: ${threadId} -> ${check?.name || cleanName}`);
     return true;
   } catch (err) {
     console.error(`⚠️ Ticket-Open Titel ändern Versuch ${attempt} fehlgeschlagen:`, err?.message || err);
@@ -1754,9 +1788,10 @@ async function forceOpenTicketThread(threadId, categoryKey, restoreName, actorId
   thread = (await fetchFreshTicketThread(threadId, categoryKey)) || thread;
 
   // Titel zuverlässig im Hintergrund ändern. Discord übernimmt Rename manchmal erst NACH dem Entarchivieren.
-  setTimeout(() => forceRenameOpenTicketThread(threadId, categoryKey, safeName, actorId, 1), 500);
-  setTimeout(() => forceRenameOpenTicketThread(threadId, categoryKey, safeName, actorId, 2), 2500);
-  setTimeout(() => forceRenameOpenTicketThread(threadId, categoryKey, safeName, actorId, 3), 6000);
+  setTimeout(() => forceRenameOpenTicketThread(threadId, categoryKey, safeName, actorId, 1), 800);
+  setTimeout(() => forceRenameOpenTicketThread(threadId, categoryKey, safeName, actorId, 2), 3000);
+  setTimeout(() => forceRenameOpenTicketThread(threadId, categoryKey, safeName, actorId, 3), 7000);
+  setTimeout(() => forceRenameOpenTicketThread(threadId, categoryKey, safeName, actorId, 4), 12000);
 
   console.log(
     `🔎 Ticket-Open Schnellstatus: thread=${threadId} archived=${thread.archived} locked=${thread.locked} name=${thread.name} targetName=${safeName}`
