@@ -1139,15 +1139,82 @@ function disableActionRows(rows = []) {
 }
 
 function stripTicketStatusPrefixes(name) {
-  return String(name || "ticket")
-    .replace(/^(closing|closed)-+/i, "")
-    .replace(/^(closing|closed)-+/i, "")
+  let clean = String(name || "ticket").trim();
+
+  // Discord kann den alten Namen mehrfach behalten, z. B. closing-closed-name.
+  // Deshalb entfernen wir Status-Prefixe in einer Schleife, nicht nur 1-2 Mal.
+  for (let i = 0; i < 10; i++) {
+    const next = clean.replace(/^(closing|closed)-+/i, "");
+    if (next === clean) break;
+    clean = next;
+  }
+
+  clean = clean
+    .replace(/^-+|-+$/g, "")
+    .replace(/-{2,}/g, "-")
     .slice(0, 95);
+
+  return clean || "ticket";
 }
 
 function getRestoreTicketName(ticket) {
   const raw = ticket?.current_name || ticket?.base_name || "ticket";
   return stripTicketStatusPrefixes(raw);
+}
+
+function getOpenTicketName(ticket, thread = null, fallbackName = null) {
+  const options = [
+    fallbackName,
+    ticket?.current_name,
+    thread?.name,
+    ticket?.base_name,
+    "ticket",
+  ];
+
+  for (const option of options) {
+    const clean = stripTicketStatusPrefixes(option);
+    if (clean && clean !== "ticket") return clean.slice(0, 95);
+  }
+
+  return "ticket";
+}
+
+async function hardRenameOpenedTicketThread(threadId, categoryKey, targetName, actorId, attempt = 1) {
+  const cleanName = stripTicketStatusPrefixes(targetName || "ticket").slice(0, 95);
+  const reason = `Ticketname nach Öffnung zurückgesetzt von ${actorId}`;
+
+  if (!cleanName || cleanName.length < 2) {
+    console.error(`⚠️ Hard-Rename Versuch ${attempt}: ungültiger Zielname`, cleanName);
+    return false;
+  }
+
+  try {
+    // Wichtig: alles in EINEM Patch. So setzt Discord Öffnen + Entsperren + Namen gleichzeitig.
+    await ticketTimeout(
+      client.rest.patch(Routes.channel(threadId), {
+        body: {
+          name: cleanName,
+          archived: false,
+          locked: false,
+        },
+        reason,
+      }),
+      9000,
+      `Hard-Rename REST Versuch ${attempt}`
+    );
+
+    await query(
+      `UPDATE ticket_records SET current_name = $2, updated_at = NOW() WHERE thread_id = $1`,
+      [threadId, cleanName]
+    ).catch((err) => console.error("⚠️ Hard-Rename DB-Update fehlgeschlagen:", err?.message || err));
+
+    const fresh = await fetchFreshTicketThread(threadId, categoryKey).catch(() => null);
+    console.log(`✅ Hard-Rename Versuch ${attempt}: Ziel=${cleanName} Discord=${fresh?.name || "unbekannt"}`);
+    return true;
+  } catch (err) {
+    console.error(`⚠️ Hard-Rename Versuch ${attempt} fehlgeschlagen:`, err?.message || err);
+    return false;
+  }
 }
 
 function getClosingTicketName(ticket) {
@@ -1701,7 +1768,6 @@ async function fetchFreshTicketThread(threadId, categoryKey = null) {
 }
 
 async function forceRenameOpenTicketThread(threadId, categoryKey, safeName, actorId, attempt = 1) {
-  const reason = `Ticketname nach Öffnung zurückgesetzt von ${actorId}`;
   const cleanName = stripTicketStatusPrefixes(safeName || "ticket").slice(0, 95);
 
   if (!cleanName || cleanName.length < 2) {
@@ -1709,46 +1775,23 @@ async function forceRenameOpenTicketThread(threadId, categoryKey, safeName, acto
     return false;
   }
 
-  const thread = await fetchFreshTicketThread(threadId, categoryKey);
+  // Erst der harte REST-Patch, weil Discord.js setName bei Threads manchmal im Cache hängen bleibt.
+  const hardOk = await hardRenameOpenedTicketThread(threadId, categoryKey, cleanName, actorId, attempt);
+  if (hardOk) return true;
 
+  // Fallback über discord.js, falls REST aus irgendeinem Grund nicht greift.
+  const thread = await fetchFreshTicketThread(threadId, categoryKey);
   if (!thread?.isThread?.()) {
     console.error(`⚠️ Ticket-Open Rename Versuch ${attempt}: Thread nicht gefunden`, threadId);
     return false;
   }
 
   try {
-    // 1) Thread erst sicher offen/entsperrt halten.
     await ticketTimeout(
-      thread.edit({ archived: false, locked: false }, reason),
-      7000,
-      `Ticket-Open freigeben vor Rename Versuch ${attempt}`
-    ).catch((err) => {
-      console.error(`⚠️ Ticket-Open Freigabe vor Rename Versuch ${attempt} fehlgeschlagen:`, err?.message || err);
-    });
-
-    await waitMs(400);
-
-    // 2) Rename über den normalen Discord.js Weg.
-    await ticketTimeout(
-      thread.setName(cleanName, reason),
-      8000,
-      `Ticket-Open setName Versuch ${attempt}`
+      thread.edit({ archived: false, locked: false, name: cleanName }, `Ticketname nach Öffnung zurückgesetzt von ${actorId}`),
+      9000,
+      `Ticket-Open edit Rename Versuch ${attempt}`
     );
-
-    // 3) Frisch laden und prüfen, ob Discord den Namen wirklich übernommen hat.
-    const fresh = await fetchFreshTicketThread(threadId, categoryKey).catch(() => null);
-    const freshName = fresh?.name || thread.name;
-
-    if (freshName !== cleanName) {
-      console.error(`⚠️ Ticket-Open Rename Versuch ${attempt}: Name noch nicht übernommen (${freshName} != ${cleanName}). Erzwinge REST-Rename...`);
-
-      // 4) Fallback direkt über REST. Das ist bei Threads oft zuverlässiger, wenn setName hängen bleibt oder Discord cached.
-      await ticketTimeout(
-        client.rest.patch(Routes.channel(threadId), { body: { name: cleanName } }),
-        8000,
-        `Ticket-Open REST-Rename Versuch ${attempt}`
-      );
-    }
 
     await query(
       `UPDATE ticket_records SET current_name = $2, updated_at = NOW() WHERE thread_id = $1`,
@@ -1773,25 +1816,28 @@ async function forceOpenTicketThread(threadId, categoryKey, restoreName, actorId
   }
 
   const reason = `Ticket wieder geöffnet von ${actorId}`;
-  const safeName = stripTicketStatusPrefixes(restoreName || thread.name || "ticket");
+  const safeName = getOpenTicketName(null, thread, restoreName);
 
-  // Erst den Thread schnell öffnen. Das blockiert den User kaum.
+  // Erst den Thread schnell öffnen UND den Namen direkt in einem Schritt setzen.
   await ticketTimeout(
-    thread.edit({ locked: false, archived: false }, reason),
-    7000,
-    "Thread schnell öffnen"
+    thread.edit({ locked: false, archived: false, name: safeName }, reason),
+    8000,
+    "Thread schnell öffnen + Namen setzen"
   ).catch((err) => {
-    console.error("⚠️ Ticket-Open: Schnelles Öffnen fehlgeschlagen:", err?.message || err);
+    console.error("⚠️ Ticket-Open: Schnelles Öffnen/Rename fehlgeschlagen:", err?.message || err);
   });
+
+  // Zusätzlich direkt REST, weil Discord beim Thread-Titel manchmal nur den Cache aktualisiert.
+  hardRenameOpenedTicketThread(threadId, categoryKey, safeName, actorId, 0).catch(() => null);
 
   // Kurz neu laden, damit Discord den Status aktualisiert.
   thread = (await fetchFreshTicketThread(threadId, categoryKey)) || thread;
 
   // Titel zuverlässig im Hintergrund ändern. Discord übernimmt Rename manchmal erst NACH dem Entarchivieren.
-  setTimeout(() => forceRenameOpenTicketThread(threadId, categoryKey, safeName, actorId, 1), 800);
-  setTimeout(() => forceRenameOpenTicketThread(threadId, categoryKey, safeName, actorId, 2), 3000);
-  setTimeout(() => forceRenameOpenTicketThread(threadId, categoryKey, safeName, actorId, 3), 7000);
-  setTimeout(() => forceRenameOpenTicketThread(threadId, categoryKey, safeName, actorId, 4), 12000);
+  setTimeout(() => forceRenameOpenTicketThread(threadId, categoryKey, safeName, actorId, 1), 1000);
+  setTimeout(() => forceRenameOpenTicketThread(threadId, categoryKey, safeName, actorId, 2), 3500);
+  setTimeout(() => forceRenameOpenTicketThread(threadId, categoryKey, safeName, actorId, 3), 8000);
+  setTimeout(() => forceRenameOpenTicketThread(threadId, categoryKey, safeName, actorId, 4), 15000);
 
   console.log(
     `🔎 Ticket-Open Schnellstatus: thread=${threadId} archived=${thread.archived} locked=${thread.locked} name=${thread.name} targetName=${safeName}`
@@ -4070,7 +4116,7 @@ client.on("interactionCreate", async (interaction) => {
             return;
           }
 
-          const restoreName = getRestoreTicketName(ticket);
+          const restoreName = getOpenTicketName(ticket, thread, getRestoreTicketName(ticket));
 
           // DB zuerst öffnen. So ist der Ticketstatus sofort korrekt, auch wenn Discord beim Entarchivieren kurz hängt.
           await ticketTimeout(
