@@ -50,6 +50,12 @@ const OWNER_ROLE_ID = "1512314174045294605";
 const CO_OWNER_ROLE_ID = "1512314174045294604";
 const HIGH_COMMAND_ROLE_ID = "1512314174045294603";
 
+// Vollzugriff-Rollen: dürfen alle Bot-Funktionen nutzen und werden immer in Ticket-Threads geholt
+const FULL_ACCESS_ROLE_IDS = [
+  "1512314174045294607",
+  "1512314174045294608",
+];
+
 const WARNING_ROLE_1_ID = "1512314173844095168";
 const WARNING_ROLE_2_ID = "1512314173844095167";
 
@@ -179,10 +185,13 @@ async function query(sql, params = []) {
 }
 
 function hasLeadershipRole(member) {
+  if (!member?.roles?.cache) return false;
+
   return (
     member.roles.cache.has(OWNER_ROLE_ID) ||
     member.roles.cache.has(CO_OWNER_ROLE_ID) ||
-    member.roles.cache.has(HIGH_COMMAND_ROLE_ID)
+    member.roles.cache.has(HIGH_COMMAND_ROLE_ID) ||
+    FULL_ACCESS_ROLE_IDS.some((roleId) => member.roles.cache.has(roleId))
   );
 }
 
@@ -914,6 +923,8 @@ const TICKET_CATEGORIES = {
 };
 
 const TICKET_STAFF_ROLE_IDS = [
+  "1512314174045294607",
+  "1512314174045294608",
   "1512314174045294606",
   "1512314174045294605",
   "1512314174045294604",
@@ -928,6 +939,8 @@ const TICKET_STAFF_ROLE_IDS = [
 ];
 
 const TICKET_MANAGEMENT_ROLE_IDS = [
+  "1512314174045294607",
+  "1512314174045294608",
   "1512314174045294606",
   "1512314174045294605",
   "1512314174045294604",
@@ -938,12 +951,16 @@ const TICKET_MANAGEMENT_ROLE_IDS = [
 
 // Sonderzugriff: Essensstand- und Event-Tickets sind nur für diese zwei Leitungsrollen sichtbar.
 const TICKET_RESTRICTED_EVENT_ROLE_IDS = [
+  "1512314174045294607",
+  "1512314174045294608",
   "1512314174045294605",
   "1512314174045294604",
 ];
 
 // Diese Rollen werden bei jedem neuen Ticket automatisch aktiv zum Thread hinzugefügt.
 const TICKET_AUTO_ADD_ROLE_IDS = [
+  "1512314174045294607",
+  "1512314174045294608",
   "1512314174045294606",
   "1512314174045294605",
   "1512314174045294604",
@@ -3803,12 +3820,9 @@ client.on("guildMemberAdd", async (member) => {
   if (!channel) return;
 
   await channel.send(
-    `Hey ${member}, herzlich willkommen im Team des Pearls! ☕💛
+    `Hey, ${member} herzlich willkommen im Pearls.🌴
 ` +
-      `Schön, dass du jetzt dabei bist – wir freuen uns auf die Zusammenarbeit mit dir.
-
-` +
-      `Bitte registriere dich noch im folgenden Channel: <#${REGISTRATION_CHANNEL_ID}>`
+      `Bitte registriere dich im folgenden Channel: <#${REGISTRATION_CHANNEL_ID}>`
   );
 });
 
