@@ -3907,6 +3907,74 @@ client.on("messageCreate", async (message) => {
   }
 });
 
+
+// =====================
+// READY / STARTUP FIX
+// =====================
+let botStarted = false;
+
+async function startBotOnce() {
+  if (botStarted) {
+    console.log("ℹ️ Ready-Event wurde erneut ausgelöst, Start wurde bereits ausgeführt.");
+    return;
+  }
+
+  botStarted = true;
+
+  console.log(`✅ Bot ist online als ${client.user?.tag || "Unbekannt"}`);
+
+  try {
+    if (client.user) {
+      client.user.setActivity("Made by Kquwi✞");
+    }
+
+    await initDatabase();
+    await registerCommands();
+    await syncEmployeeRoles();
+    await updateTotalWorktimeMessage();
+    await updateWeeklyWorktimeMessage();
+    await updateDashboardMessage();
+    await updateWeeklyStatisticsMessage();
+    await updateManagementTasksMessage();
+    await sendStockCheckReminderIfNeeded(true);
+
+    setInterval(checkReminders, 60 * 1000);
+    setInterval(updateTotalWorktimeMessage, 2 * 60 * 1000);
+    setInterval(updateWeeklyWorktimeMessage, 2 * 60 * 1000);
+    setInterval(updateDashboardMessage, 2 * 60 * 1000);
+    setInterval(updateWeeklyStatisticsMessage, 5 * 60 * 1000);
+    setInterval(updateManagementTasksMessage, 5 * 60 * 1000);
+    setInterval(sendStockCheckReminderIfNeeded, 60 * 1000);
+    setInterval(weeklyResetOnly, 60 * 1000);
+    setInterval(checkTicketCloseDeadlines, 60 * 1000);
+    setInterval(checkWarningReviewReminders, 60 * 60 * 1000);
+
+    console.log("✅ Stempel-Uhr System gestartet.");
+  } catch (err) {
+    console.error("❌ Fehler beim Start:", err);
+  }
+}
+
+client.once("ready", startBotOnce);
+client.once("clientReady", startBotOnce);
+
+// Falls Discord.js ready schon gesetzt hat, aber das Event wegen Hot-Reload/Timing nicht mehr kommt.
+setTimeout(() => {
+  if (!botStarted && client.isReady?.()) {
+    console.log("ℹ️ Client ist bereits ready. Starte System über Fallback.");
+    startBotOnce().catch((err) => console.error("❌ Ready-Fallback fehlgeschlagen:", err));
+  }
+}, 5000);
+
+// =====================
+// MEMBER LEAVE
+// =====================
+client.on("guildMemberRemove", async (member) => {
+  await deleteEmployeeTimeData(member.id).catch((err) => console.error("❌ Member-Leave Zeitdaten löschen fehlgeschlagen:", err));
+  await updateTotalWorktimeMessage().catch(() => null);
+  await updateWeeklyWorktimeMessage().catch(() => null);
+});
+
 client.on("guildMemberAdd", async (member) => {
   const channel = await client.channels.fetch(WELCOME_CHANNEL_ID).catch(() => null);
   if (!channel) return;
