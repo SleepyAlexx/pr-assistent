@@ -1595,7 +1595,16 @@ async function addAllowedStaffToThread(thread, categoryKey) {
       console.error("⚠️ Bot konnte dem Ticket-Thread nicht beitreten:", err?.message || err);
     });
 
-    const result = await addRoleMembersToThreadFromCache(thread, guild, categoryKey, "Sofort-Cache");
+    // Bungalow und Allgemeine Anfrage sollen exakt dieselben Staff-Rollen bekommen.
+    // Deshalb wird hier VOR dem ersten Hinzufügen einmal aktiv der Member-Cache geladen.
+    // So werden nicht nur die 1-2 gerade gecachten Personen eingeladen.
+    if (categoryKey === "bungalow" || categoryKey === "allgemein") {
+      await fetchAllGuildMembersForTicketAutoAdd(guild, `Direkter Staff-Fetch für ${categoryKey}`, true).catch((err) => {
+        console.error(`⚠️ Direkter Staff-Fetch für ${categoryKey} fehlgeschlagen, nutze Cache:`, err?.message || err);
+      });
+    }
+
+    const result = await addRoleMembersToThreadFromCache(thread, guild, categoryKey, "Direkter Staff-Add");
     scheduleTicketStaffAutoAdd(thread.id, categoryKey, 2500);
 
     return result;
