@@ -77,9 +77,9 @@ const CORRECTION_CHANNEL_ID = "1512314176884703299";
 const PERSONAL_OVERVIEW_CHANNEL_ID = "1512314181259366547";
 const TIME_LOG_CHANNEL_ID = "1512314180752117936";
 
-const SHOPPING_CHANNEL_ID = "1512314177396543580";
-const APPLICATION_CHANNEL_ID = "1512314177396543580";
-const HOUSE_BAN_CHANNEL_ID = "1512314177396543580";
+const SHOPPING_CHANNEL_ID = "1512314177396543582";
+const APPLICATION_CHANNEL_ID = "1513128952275669135";
+const HOUSE_BAN_CHANNEL_ID = "1512314177396543583";
 
 const MANAGEMENT_PANEL_CHANNEL_ID = "1512314180752117930";
 const MANAGEMENT_OUTPUT_CHANNEL_ID = "1512314176486506584";
@@ -5234,6 +5234,7 @@ client.on("interactionCreate", async (interaction) => {
         modal.addComponents(
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("app_name").setLabel("IC Name").setStyle(TextInputStyle.Short).setRequired(true)),
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("app_age").setLabel("Alter").setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("app_phone").setLabel("Telefonnummer").setPlaceholder("z. B. 555-1234").setStyle(TextInputStyle.Short).setRequired(true)),
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("app_experience").setLabel("Erfahrung").setStyle(TextInputStyle.Paragraph).setRequired(true)),
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("app_reason").setLabel("Warum möchtest du zu uns?").setStyle(TextInputStyle.Paragraph).setRequired(true))
         );
@@ -5810,6 +5811,7 @@ ${nicknameText}${roleText}`,
       if (interaction.customId === "application_modal") {
         const name = interaction.fields.getTextInputValue("app_name");
         const age = interaction.fields.getTextInputValue("app_age");
+        const phone = interaction.fields.getTextInputValue("app_phone");
         const experience = interaction.fields.getTextInputValue("app_experience");
         const reason = interaction.fields.getTextInputValue("app_reason");
         const channel = await client.channels.fetch(APPLICATION_CHANNEL_ID);
@@ -5820,6 +5822,7 @@ ${nicknameText}${roleText}`,
           .addFields(
             { name: "Name", value: name },
             { name: "Alter", value: age },
+            { name: "Telefonnummer", value: phone },
             { name: "Erfahrung", value: experience },
             { name: "Warum?", value: reason },
             { name: "Status", value: "🕒 Offen" },
