@@ -3767,6 +3767,53 @@ function normalizeBusinessName(name) {
     .trim();
 }
 
+
+function cleanBusinessNameFromMember(member) {
+  const raw = String(
+    member?.nickname ||
+    member?.displayName ||
+    member?.user?.globalName ||
+    member?.user?.username ||
+    ""
+  ).trim();
+
+  if (!raw) return null;
+
+  let cleaned = raw
+    .replace(/^[^a-zA-ZäöüÄÖÜß0-9]+/g, "")
+    .replace(/^(pearls|pr|probe|mitarbeiter|employee|azubi|casino)\s*(\||i|-|–|—|:)\s*/i, "")
+    .replace(/^.+?\s*(\|| i | - | – | — |:)\s*/i, (match) => {
+      const lower = match.toLowerCase();
+      if (lower.includes("pearls") || lower.includes("pr") || lower.includes("probe") || lower.includes("mitarbeiter") || lower.includes("casino")) return "";
+      return match;
+    })
+    .replace(/[ ]+/g, " ")
+    .trim();
+
+  // Falls jemand z. B. nur einen Rang/Emoji als Nickname hat, lieber nicht automatisch speichern.
+  if (!cleaned || cleaned.length < 3 || !cleaned.includes(" ")) return null;
+
+  return formatName(cleaned);
+}
+
+async function autoLinkBusinessNameFromMember(member, reason = "Automatische Business-Verknüpfung") {
+  try {
+    const cleanName = cleanBusinessNameFromMember(member);
+
+    if (!cleanName) {
+      console.log(`⚠️ Auto-Business-Link übersprungen für ${member?.user?.tag || member?.id}: Kein sauberer Vor- und Nachname im Nickname gefunden.`);
+      return null;
+    }
+
+    const link = await upsertBusinessUserLink(member.id, cleanName, "AUTO_ROLE_SYNC");
+    console.log(`✅ Auto-Business-Link gespeichert: ${cleanName} → ${member.user.tag} (${member.id}) | Grund: ${reason}`);
+    return link;
+  } catch (err) {
+    console.error("❌ Auto-Business-Link fehlgeschlagen:", err);
+    return null;
+  }
+}
+
 async function upsertBusinessUserLink(userId, name, linkedBy) {
   const cleanName = String(name || "").trim().replace(/\s+/g, " ");
   const nameKey = normalizeBusinessName(cleanName);
@@ -4028,6 +4075,7 @@ client.on("guildMemberUpdate", async (oldMember, newMember) => {
   if (!hadProbeRole && hasProbeRole) {
     await ensureEmployee(newMember.id);
     await query(`UPDATE employees SET left_server = FALSE WHERE user_id = $1`, [newMember.id]);
+    await autoLinkBusinessNameFromMember(newMember, "Probe-Mitarbeiter-Rolle erhalten");
     await updateTotalWorktimeMessage();
     await updateWeeklyWorktimeMessage();
     console.log(`✅ ${newMember.user.tag} wurde durch Probezeit-Rolle in die Zeitliste aufgenommen.`);
@@ -4036,9 +4084,17 @@ client.on("guildMemberUpdate", async (oldMember, newMember) => {
   if (!hadRole && hasRole) {
     await ensureEmployee(newMember.id);
     await query(`UPDATE employees SET left_server = FALSE WHERE user_id = $1`, [newMember.id]);
+    await autoLinkBusinessNameFromMember(newMember, "Mitarbeiter-Rolle erhalten");
     await updateTotalWorktimeMessage();
     await updateWeeklyWorktimeMessage();
     console.log(`✅ ${newMember.user.tag} wurde als Mitarbeiter hinzugefügt.`);
+  }
+
+  const oldDisplayName = String(oldMember.nickname || oldMember.displayName || oldMember.user?.globalName || oldMember.user?.username || "");
+  const newDisplayName = String(newMember.nickname || newMember.displayName || newMember.user?.globalName || newMember.user?.username || "");
+
+  if ((hasProbeRole || hasRole) && oldDisplayName !== newDisplayName) {
+    await autoLinkBusinessNameFromMember(newMember, "Nickname/Name geändert während Mitarbeiterrolle vorhanden ist");
   }
 
   if (hadRole && !hasRole) {
@@ -5657,6 +5713,9 @@ client.on("interactionCreate", async (interaction) => {
         }
 
         const roleResult = await safeAddRoles(interaction.member, REGISTRATION_ROLE_IDS);
+        await upsertBusinessUserLink(interaction.user.id, fullName, "REGISTRATION_MODAL").catch((err) => {
+          console.error("❌ Business-Name konnte bei Registrierung nicht automatisch verknüpft werden:", err);
+        });
 
         if (roleResult.failed.length > 0) {
           roleText =
