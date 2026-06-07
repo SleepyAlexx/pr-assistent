@@ -3867,7 +3867,7 @@ client.on("messageCreate", async (message) => {
       authorIsBot: Boolean(message.author?.bot),
       contentLength: message.content?.length || 0,
       embedCount: message.embeds?.length || 0,
-      preview: businessMessageText(message).slice(0, 700),
+      preview: collectEmbedTextForBusinessTimeLog(message).slice(0, 700),
     });
 
     if (!parsed) {
@@ -3878,7 +3878,7 @@ client.on("messageCreate", async (message) => {
     const linkedUser = await getBusinessUserLink(parsed.businessId);
 
     console.log("✅ Business-Zeitlog erkannt:", {
-      name: parsed.name,
+      name: parsed.employeeName,
       businessId: parsed.businessId,
       action: parsed.action,
       durationText: parsed.durationText,
@@ -3887,7 +3887,7 @@ client.on("messageCreate", async (message) => {
     });
 
     if (!linkedUser) {
-      console.log(`ℹ️ Business-ID ${parsed.businessId} ist noch nicht verknüpft. Nutze /business-link user:@User business_id:${parsed.businessId} name:${parsed.name}`);
+      console.log(`ℹ️ Business-ID ${parsed.businessId} ist noch nicht verknüpft. Nutze /business-link user:@User business_id:${parsed.businessId} name:${parsed.employeeName}`);
       return;
     }
 
