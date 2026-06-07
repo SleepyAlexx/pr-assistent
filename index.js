@@ -1,14 +1,3 @@
-// Pearls Bot - Komplettscript
-// Grundlage: aktuelles CaffeeContainer-Script, angepasst auf den neuen Pearls-Discord.
-// Update: 3-Stunden-Pflicht entfernt, Bungalow- & Essensstand-Buchungen ergänzt, Status gesetzt.
-// Update: Teamupdate-Rollen korrigiert, Probe-Mitarbeiter und Casino-Mitarbeiter ergänzt, Verwarnungen aus Teamupdate entfernt.
-// Update: Ticket-System mit öffentlichen Threads, Claim-System, Add/Remove/Rename/Close/Open Commands ergänzt.
-// Update: Private Ticket-Threads + stabilerer Member-Fetch ohne Query + Debug-Logs im Ticket-Debug-Channel.
-// Update: Ticket-System final stabilisiert: Private Threads, Strict Remove, stabiles Rename/Close, Bürgerrollen blockiert.
-// Update: Geschlossene Tickets werden gelockt/archiviert und nach 2 Tagen automatisch gelöscht.
-// Wichtig: DISCORD_TOKEN, CLIENT_ID, GUILD_ID und DATABASE_URL in der .env eintragen.
-// Update: Business-Zeitlogs werden beim Ausstempeln automatisch in Wochenzeit/Gesamtzeit übernommen.
-
 if (process.env.NODE_ENV !== "production") require("dotenv").config();
 
 const {
@@ -45,22 +34,16 @@ console.log("🔎 Env-Check:", {
   nodeEnv: process.env.NODE_ENV || null,
 });
 
-// Discord Bot Index Complete
-// =====================
-// ROLLEN
-// =====================
 const MANAGER_ROLE_ID = "1512314173936238659";
 const EMPLOYEE_ROLE_ID = "1512314173936238653";
 const PROBE_ROLE_ID = "1512314173936238652";
 const DUTY_ROLE_ID = "1512314173936238655";
 const PERSONAL_MANAGER_ROLE_ID = "1512314173936238660";
 
-// Leitungsrollen dürfen alle Panels und Management-Funktionen nutzen
 const OWNER_ROLE_ID = "1512314174045294605";
 const CO_OWNER_ROLE_ID = "1512314174045294604";
 const HIGH_COMMAND_ROLE_ID = "1512314174045294603";
 
-// Vollzugriff-Rollen: dürfen alle Bot-Funktionen nutzen und werden immer in Ticket-Threads geholt
 const FULL_ACCESS_ROLE_IDS = [
   "1512314174045294607",
   "1512314174045294608",
@@ -69,7 +52,6 @@ const FULL_ACCESS_ROLE_IDS = [
 const WARNING_ROLE_1_ID = "1512314173844095168";
 const WARNING_ROLE_2_ID = "1512314173844095167";
 
-// Teamupdate-Rollen
 const TEAMUPDATE_EMPLOYEE_ROLE_ID = "1512314173936238653";
 const TEAMUPDATE_PROBE_EMPLOYEE_ROLE_ID = "1512314173936238652";
 const TEAMUPDATE_EMPLOYEE_BASE_ROLE_ID = "1512314173936238656";
@@ -82,9 +64,6 @@ const TEAMUPDATE_PERSONAL_MANAGER_ROLE_ID = "1512314173936238660";
 const TEAMUPDATE_CASINO_EMPLOYEE_ROLE_ID = "1512619917915197580";
 const TEAMUPDATE_CASINO_BASE_ROLE_ID = "1512619798234923058";
 
-// =====================
-// CHANNELS
-// =====================
 const REQUEST_CHANNEL_ID = "1512314177396543580";
 const ABSENCE_CHANNEL_ID = "1512314177396543578";
 
@@ -120,11 +99,6 @@ const TICKET_DEBUG_CHANNEL_ID = "1512779121170714695";
 const BOOKING_REQUEST_CHANNEL_ID = "1512409329771221075";
 const BOOKING_CONFIRMED_CHANNEL_ID = "1512409661029224488";
 
-// =====================
-// TICKET-SYSTEM
-// =====================
-// Wichtig: Für Event und Allgemein bitte später die richtigen Channel-IDs eintragen,
-// falls dafür eigene Bereiche erstellt werden. Aktuell laufen sie als Fallback in den Buchungen-Channel.
 const TICKET_BUNGALOW_CHANNEL_ID = "1512762754732261386";
 const TICKET_ESSENSSTAND_CHANNEL_ID = "1512762825603285193";
 const TICKET_EVENT_CHANNEL_ID = "1512762866917441617";
@@ -145,26 +119,15 @@ const REGISTRATION_ROLE_IDS = [
   "1512314173844095175",
 ];
 
-// Bürgerrollen: dürfen keine Slash-Commands nutzen, solange sie keine Team-/Leitungsrolle haben.
-// Sie werden außerdem nicht automatisch in Ticket-Threads eingeladen.
 const CITIZEN_COMMAND_BLOCK_ROLE_IDS = [
   "1512314173844095170",
   "1512314173844095175",
 ];
 
-// =====================
-// EINSTELLUNGEN
-// =====================
 const PROBE_RANKUP_MINUTES = 600;
 const REMINDER_AFTER_MS = 2 * 60 * 60 * 1000;
 const REMINDER_RESPONSE_MS = 10 * 60 * 1000;
 const LEADERBOARD_PAGE_SIZE = 7;
-
-// =====================
-// ZEITEN
-// =====================
-// Die alten Fivebot-Import-Zeiten wurden entfernt.
-// Die Zeiten werden jetzt ausschließlich aus der Datenbank gelesen und gespeichert.
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
@@ -178,18 +141,12 @@ const client = new Client({
 const managementDrafts = new Map();
 const timeManagementDrafts = new Map();
 
-// Ticket-Remove Schutz: Wenn ein User aus einem Ticket entfernt wurde,
-// darf ihn die Auto-Add-Logik nicht erneut in genau diesen Thread packen.
-// Die Datenbank bleibt die Hauptquelle, diese Map schützt zusätzlich während der Laufzeit.
 const ticketRemovalBlocklist = new Map();
 
 function draftKey(userId, type) {
   return `${userId}:${type}`;
 }
 
-// =====================
-// HELPER
-// =====================
 async function query(sql, params = []) {
   return pool.query(sql, params);
 }
@@ -333,9 +290,6 @@ function replaceStatusField(embed, statusText) {
   return fields;
 }
 
-// =====================
-// DATABASE
-// =====================
 async function initDatabase() {
   await query(`
     CREATE TABLE IF NOT EXISTS employees (
@@ -403,7 +357,6 @@ async function initDatabase() {
     );
   `);
 
-  // Neue stabile Verknüpfung über Namen, weil die Business-ID im Fremdsystem wechseln kann.
   await query(`
     CREATE TABLE IF NOT EXISTS business_name_links (
       name_key TEXT PRIMARY KEY,
@@ -415,7 +368,6 @@ async function initDatabase() {
     );
   `);
 
-  // Verhindert, dass ein Ausstempel-Log mehrfach gezählt wird.
   await query(`
     CREATE TABLE IF NOT EXISTS business_time_imports (
       message_id TEXT PRIMARY KEY,
@@ -536,15 +488,9 @@ async function initDatabase() {
     );
   `);
 
-  // Keine alten Fivebot-Zeiten mehr importieren.
-  // Bestehende Zeiten bleiben in der Datenbank erhalten.
-
   console.log("✅ Datenbank bereit.");
 }
 
-// =====================
-// COMMANDS
-// =====================
 async function registerCommands() {
   console.log("🔄 Slash Commands werden vorbereitet...");
 
@@ -611,7 +557,6 @@ async function registerCommands() {
       .setName("ticket-close")
       .setDescription("Startet eine Schließungsanfrage für das aktuelle Ticket."),
 
-    // Alias ohne Bindestrich, falls man /ticketclose eingibt
     new SlashCommandBuilder()
       .setName("ticketclose")
       .setDescription("Startet eine Schließungsanfrage für das aktuelle Ticket."),
@@ -626,7 +571,6 @@ async function registerCommands() {
           .setRequired(false)
       ),
 
-    // Alias ohne Bindestrich, falls man /ticketopen eingibt
     new SlashCommandBuilder()
       .setName("ticketopen")
       .setDescription("Öffnet ein archiviertes/geschlossenes Ticket wieder.")
@@ -725,8 +669,6 @@ async function registerCommands() {
     }
   }
 
-  // Wir registrieren die Commands zuerst über den bereits verbundenen Guild-Client.
-  // Das ist auf Railway oft stabiler als der direkte REST-Aufruf beim Start.
   try {
     console.log(`🔄 Slash Commands werden registriert über Guild-Client: ${commands.length} Commands für Guild ${GUILD_ID}...`);
 
@@ -739,7 +681,6 @@ async function registerCommands() {
     console.error("⚠️ Guild-Client Registrierung fehlgeschlagen. Versuche REST-Fallback...", guildErr);
   }
 
-  // Fallback: direkter REST-Bulk-Overwrite. Alte Commands werden NICHT vorher gelöscht.
   try {
     console.log(`🔄 Slash Commands werden registriert über REST-Fallback: ${commands.length} Commands für Guild ${GUILD_ID}...`);
 
@@ -759,9 +700,6 @@ async function registerCommands() {
   }
 }
 
-// =====================
-// BUTTONS / COMPONENTS
-// =====================
 function clockButtons() {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId("clock_in").setLabel("Einstempeln").setEmoji("🟢").setStyle(ButtonStyle.Success),
@@ -827,7 +765,6 @@ function managementPanelRows() {
 
   return [row1, row2];
 }
-
 
 function timeManagementPanelRows() {
   const row1 = new ActionRowBuilder().addComponents(
@@ -957,9 +894,6 @@ function buildBookingEmbed(data) {
     .setTimestamp();
 }
 
-// =====================
-// TICKET-SYSTEM HELPERS
-// =====================
 const TICKET_CATEGORIES = {
   bungalow: {
     label: "Bungalow buchen",
@@ -1026,7 +960,6 @@ const TICKET_MANAGEMENT_ROLE_IDS = [
   "1512314173936238658",
 ];
 
-// Sonderzugriff: Essensstand- und Event-Tickets sind nur für diese zwei Leitungsrollen sichtbar.
 const TICKET_RESTRICTED_EVENT_ROLE_IDS = [
   "1512314174045294607",
   "1512314174045294608",
@@ -1034,7 +967,6 @@ const TICKET_RESTRICTED_EVENT_ROLE_IDS = [
   "1512314174045294604",
 ];
 
-// Diese Rollen werden bei jedem neuen Ticket automatisch aktiv zum Thread hinzugefügt.
 const TICKET_AUTO_ADD_ROLE_IDS = [
   "1512314174045294607",
   "1512314174045294608",
@@ -1096,7 +1028,6 @@ function memberTicketName(member, user) {
 }
 
 function categoryRoles(categoryKey) {
-  // Essensstand- und Event-Tickets dürfen nur von den zwei angegebenen Rollen gesehen/verwaltet werden.
   if (categoryKey === "essensstand" || categoryKey === "event") {
     return TICKET_RESTRICTED_EVENT_ROLE_IDS;
   }
@@ -1106,7 +1037,6 @@ function categoryRoles(categoryKey) {
 }
 
 function ticketAutoAddRoles(categoryKey) {
-  // Bei Essensstand und Event werden automatisch nur diese zwei Rollen in den privaten Thread eingeladen.
   if (categoryKey === "essensstand" || categoryKey === "event") {
     return TICKET_RESTRICTED_EVENT_ROLE_IDS;
   }
@@ -1130,8 +1060,6 @@ function formatRenamedTicketName(rawName, categoryKey) {
 
   if (!category) return cleaned.slice(0, 95);
 
-  // Wichtig: Die Kategorie bleibt immer im Namen erhalten.
-  // Dadurch bleiben spätere Commands stabil, auch wenn der Thread manuell/über Command umbenannt wurde.
   const lower = cleaned.toLowerCase();
   const suffix = `${category.emoji}-${category.short}`;
 
@@ -1153,7 +1081,6 @@ function isRestrictedCitizenCommandUser(member) {
   const hasCitizenRole = memberHasAnyRole(member, CITIZEN_COMMAND_BLOCK_ROLE_IDS);
   if (!hasCitizenRole) return false;
 
-  // Sobald jemand eine Team-/Leitungsrolle hat, darf er Commands nutzen, auch wenn er noch Bürgerrollen besitzt.
   const hasTeamOrLeadershipRole = memberHasAnyRole(member, TICKET_AUTO_ADD_ROLE_IDS);
   return !hasTeamOrLeadershipRole;
 }
@@ -1177,9 +1104,6 @@ async function getOrRecoverTicketFromThread(thread) {
   const existing = await getTicketByThread(thread.id);
   if (existing) return existing;
 
-  // Fallback: Falls ein altes Ticket nicht mehr in der DB gefunden wird,
-  // versuchen wir die Kategorie aus dem Threadnamen zu erkennen und registrieren es neu.
-  // So brechen Commands nicht direkt ab, nur weil der Name geändert wurde oder ein DB-Eintrag fehlt.
   const categoryKey = detectTicketCategoryFromName(thread.name);
   if (!categoryKey) return null;
 
@@ -1205,7 +1129,6 @@ async function getOrRecoverTicketFromThread(thread) {
 }
 
 async function getTicketFromCloseToken(token) {
-  // Neue Buttons speichern die Thread-ID im CustomId. Alte Buttons mit Ticket-ID werden weiterhin unterstützt.
   const clean = String(token || "");
 
   let res = await query(`SELECT * FROM ticket_records WHERE thread_id = $1`, [clean]).catch(() => ({ rows: [] }));
@@ -1237,8 +1160,6 @@ function disableActionRows(rows = []) {
 function stripTicketStatusPrefixes(name) {
   let clean = String(name || "ticket").trim();
 
-  // Discord kann den alten Namen mehrfach behalten, z. B. closing-closed-name.
-  // Deshalb entfernen wir Status-Prefixe in einer Schleife, nicht nur 1-2 Mal.
   for (let i = 0; i < 10; i++) {
     const next = clean.replace(/^(closing|closed)-+/i, "");
     if (next === clean) break;
@@ -1285,7 +1206,6 @@ async function hardRenameOpenedTicketThread(threadId, categoryKey, targetName, a
   }
 
   try {
-    // Wichtig: alles in EINEM Patch. So setzt Discord Öffnen + Entsperren + Namen gleichzeitig.
     await ticketTimeout(
       client.rest.patch(Routes.channel(threadId), {
         body: {
@@ -1381,7 +1301,6 @@ async function unmarkTicketUserRemoved(threadId, userId) {
 async function forceRemoveTicketMember(thread, userId, reason = "Ticket-Mitglied entfernt") {
   const results = [];
 
-  // 1) Direkt entfernen. Dadurch muss der Command nicht zwei Mal ausgeführt werden.
   try {
     await thread.members.remove(userId);
     results.push("✅ Direktes Entfernen ausgeführt");
@@ -1389,7 +1308,6 @@ async function forceRemoveTicketMember(thread, userId, reason = "Ticket-Mitglied
     results.push(`❌ Direktes Entfernen fehlgeschlagen: ${err?.code || "NO_CODE"}: ${err?.message || err}`);
   }
 
-  // 2) Kurz danach nur prüfen. Ein zweiter Remove passiert nur, wenn Discord den User wirklich noch im Thread sieht.
   setTimeout(async () => {
     const stillBlocked = await isTicketUserRemoved(thread.id, userId).catch(() => false);
     if (!stillBlocked) return;
@@ -1398,7 +1316,6 @@ async function forceRemoveTicketMember(thread, userId, reason = "Ticket-Mitglied
     try {
       stillInThread = await thread.members.fetch(userId);
     } catch (err) {
-      // Wenn Discord den Thread-Member nicht mehr findet, ist der User bereits draußen.
       stillInThread = null;
       results.push("✅ Prüfung: User ist nicht mehr im Thread");
     }
@@ -1488,9 +1405,6 @@ function getDiscordRetryAfterMs(err, fallbackMs = 8000) {
 }
 
 async function fetchAllGuildMembersForTicketAutoAdd(guild, reason = "Ticket-Auto-Add") {
-  // Private Threads können keine Rollen direkt bekommen, sondern nur einzelne Mitglieder.
-  // Deshalb braucht der Bot manchmal die Member-Liste. Das läuft nur im Hintergrund,
-  // damit Buttons und Slash-Commands niemals dadurch hängen bleiben.
   if (ticketFullMemberFetchPromise) return ticketFullMemberFetchPromise;
 
   const now = Date.now();
@@ -1737,7 +1651,6 @@ async function createTicketFromButton(interaction, categoryKey) {
   }
 }
 
-
 async function claimTicket(interaction) {
   const ticket = await ensureTicketThread(interaction);
   if (!ticket) return;
@@ -1805,22 +1718,18 @@ function safeThreadUnarchiveUnlock(thread, reason = "Ticket freigeben") {
 
   setTimeout(async () => {
     await thread.setArchived(false, reason).catch((err) => {
-      // Nicht kritisch, wenn der Thread sowieso offen ist.
       console.error("⚠️ Thread entarchivieren fehlgeschlagen:", err?.message || err);
     });
 
     await thread.setLocked(false, reason).catch((err) => {
-      // Nicht kritisch, wenn der Thread sowieso nicht gelockt ist.
       console.error("⚠️ Thread entsperren fehlgeschlagen:", err?.message || err);
     });
   }, 250);
 }
 
-
 async function fetchTicketThreadForOpen(threadId, categoryKey = null) {
   if (!threadId) return null;
 
-  // 1) Direkt über den Discord-Client versuchen.
   let thread = await ticketTimeout(
     client.channels.fetch(threadId, { force: true }),
     8000,
@@ -1832,7 +1741,6 @@ async function fetchTicketThreadForOpen(threadId, categoryKey = null) {
 
   if (thread?.isThread?.()) return thread;
 
-  // 2) Über den Elternkanal der Ticket-Kategorie versuchen.
   const category = categoryKey ? TICKET_CATEGORIES[categoryKey] : null;
   const parentIds = category?.channelId
     ? [category.channelId]
@@ -1886,11 +1794,9 @@ async function forceRenameOpenTicketThread(threadId, categoryKey, safeName, acto
     return false;
   }
 
-  // Erst der harte REST-Patch, weil Discord.js setName bei Threads manchmal im Cache hängen bleibt.
   const hardOk = await hardRenameOpenedTicketThread(threadId, categoryKey, cleanName, actorId, attempt);
   if (hardOk) return true;
 
-  // Fallback über discord.js, falls REST aus irgendeinem Grund nicht greift.
   const thread = await fetchFreshTicketThread(threadId, categoryKey);
   if (!thread?.isThread?.()) {
     console.error(`⚠️ Ticket-Open Rename Versuch ${attempt}: Thread nicht gefunden`, threadId);
@@ -1929,7 +1835,6 @@ async function forceOpenTicketThread(threadId, categoryKey, restoreName, actorId
   const reason = `Ticket wieder geöffnet von ${actorId}`;
   const safeName = getOpenTicketName(null, thread, restoreName);
 
-  // Erst den Thread schnell öffnen UND den Namen direkt in einem Schritt setzen.
   await ticketTimeout(
     thread.edit({ locked: false, archived: false, name: safeName }, reason),
     8000,
@@ -1938,13 +1843,10 @@ async function forceOpenTicketThread(threadId, categoryKey, restoreName, actorId
     console.error("⚠️ Ticket-Open: Schnelles Öffnen/Rename fehlgeschlagen:", err?.message || err);
   });
 
-  // Zusätzlich direkt REST, weil Discord beim Thread-Titel manchmal nur den Cache aktualisiert.
   hardRenameOpenedTicketThread(threadId, categoryKey, safeName, actorId, 0).catch(() => null);
 
-  // Kurz neu laden, damit Discord den Status aktualisiert.
   thread = (await fetchFreshTicketThread(threadId, categoryKey)) || thread;
 
-  // Titel zuverlässig im Hintergrund ändern. Discord übernimmt Rename manchmal erst NACH dem Entarchivieren.
   setTimeout(() => forceRenameOpenTicketThread(threadId, categoryKey, safeName, actorId, 1), 1000);
   setTimeout(() => forceRenameOpenTicketThread(threadId, categoryKey, safeName, actorId, 2), 3500);
   setTimeout(() => forceRenameOpenTicketThread(threadId, categoryKey, safeName, actorId, 3), 8000);
@@ -1958,7 +1860,6 @@ async function forceOpenTicketThread(threadId, categoryKey, restoreName, actorId
 }
 
 function scheduleTicketOpenFinalization(threadId, ticket, actorId, restoreName) {
-  // Sofort starten, nicht erst warten. Der User soll den Thread schnell offen sehen.
   setTimeout(async () => {
     console.log(`🔓 Ticket-Open-Schnellfinalisierung gestartet: ${threadId}`);
 
@@ -1972,7 +1873,6 @@ function scheduleTicketOpenFinalization(threadId, ticket, actorId, restoreName) 
       return;
     }
 
-    // Öffentliche Nachricht direkt nach dem Öffnen senden.
     await ticketTimeout(
       thread.send({
         content:
@@ -1988,10 +1888,8 @@ function scheduleTicketOpenFinalization(threadId, ticket, actorId, restoreName) 
       console.error("⚠️ Ticket-Open: Öffentliche Nachricht konnte nicht gesendet werden:", err?.message || err);
     });
 
-    // Teammitglieder im Hintergrund hinzufügen. Das darf den Open-Prozess nicht bremsen.
     scheduleTicketStaffAutoAdd(thread.id, ticket.category, 500);
 
-    // Sicherheits-Nachzieh-Fix: Falls Discord den Thread erst verzögert wirklich öffnet.
     setTimeout(() => {
       forceOpenTicketThread(threadId, ticket?.category, restoreName, actorId).catch((err) => {
         console.error("⚠️ Ticket-Open Sicherheits-Fix fehlgeschlagen:", err?.message || err);
@@ -2024,9 +1922,7 @@ function scheduleTicketArchiveFinalization(thread, closedName) {
   }, 750);
 }
 
-
 async function requestTicketClose(interaction) {
-  // Sofort antworten: Slash-Commands dürfen niemals durch Rename/Archivierung hängen.
   await interaction.deferReply({ ephemeral: true }).catch(() => null);
   await interaction.editReply({ content: "⏳ Schließungsanfrage wird vorbereitet..." }).catch(() => null);
 
@@ -2062,7 +1958,6 @@ async function requestTicketClose(interaction) {
     const deadline = new Date(Date.now() + TICKET_CLOSE_AFTER_MS);
     const closingName = getClosingTicketName(ticket);
 
-    // Status zuerst setzen. Die Thread-Umbenennung ist nur Optik und darf nie den Command blockieren.
     const dbStart = await ticketTimeout(
       query(
         `
@@ -2088,7 +1983,6 @@ async function requestTicketClose(interaction) {
       return interaction.editReply({ content: "❌ Die Schließungsanfrage konnte nicht in der Datenbank gespeichert werden." }).catch(() => null);
     }
 
-    // Nicht awaiten: Discord/Railway kann beim Umbenennen hängen oder Rate-Limit haben.
     safeThreadRename(thread, closingName, `Schließungsanfrage von ${interaction.user.tag}`, "Ticket für Schließung umbenennen");
 
     const embed = new EmbedBuilder()
@@ -2118,7 +2012,6 @@ async function requestTicketClose(interaction) {
     });
 
     if (!msg) {
-      // Rollback, damit nicht dauerhaft closing_requested stehen bleibt, obwohl keine Buttons existieren.
       await query(
         `
         UPDATE ticket_records
@@ -2155,8 +2048,6 @@ async function requestTicketClose(interaction) {
 }
 
 async function archiveTicketForDeletion(thread, ticket, actorId, reasonText) {
-  // Diese Funktion darf keine Interactions blockieren. Kritisch ist nur: DB auf closed setzen.
-  // Rename/Lock/Archive laufen danach im Hintergrund, weil genau diese Discord-Aktionen bei dir Timeouts erzeugt haben.
   const deleteAt = new Date(Date.now() + TICKET_DELETE_AFTER_CLOSE_MS);
   const restoreName = getRestoreTicketName(ticket);
   const closedName = `closed-${restoreName}`.slice(0, 95);
@@ -2196,7 +2087,6 @@ async function archiveTicketForDeletion(thread, ticket, actorId, reasonText) {
     "Ticket-Geschlossen-Nachricht senden"
   ).catch((err) => console.error("⚠️ Ticket-Geschlossen-Nachricht konnte nicht gesendet werden:", err?.message || err));
 
-  // Hintergrund-Finalisierung: nicht awaiten, damit Button/Command nicht hängen bleibt.
   scheduleTicketArchiveFinalization(thread, closedName);
 }
 
@@ -2282,9 +2172,6 @@ async function handleTicketCloseDecision(interaction, closeToken, decision) {
       return safePrivate("✅ Ticket wurde geschlossen. Lock/Archivierung läuft im Hintergrund, damit nichts mehr hängt.");
     }
 
-    // =====================
-    // ABBRECHEN / CANCEL
-    // =====================
     const restoreName = getRestoreTicketName(ticket);
     const threadId = ticket.thread_id || thread.id;
 
@@ -2311,7 +2198,6 @@ async function handleTicketCloseDecision(interaction, closeToken, decision) {
 
     await runStep("Schließen/Abbrechen-Buttons deaktivieren", () => interaction.message.edit({ components: disableActionRows(interaction.message.components) }), 4000);
 
-    // Kein await auf Rename/Unlock: Das waren die Timeouts in deinen Logs.
     safeThreadUnarchiveUnlock(thread, "Schließungsanfrage abgebrochen");
     safeThreadRename(thread, restoreName, `Schließung abgebrochen von ${interaction.user.tag}`, "Threadname nach Abbruch zurücksetzen");
 
@@ -2391,10 +2277,6 @@ async function checkTicketCloseDeadlines() {
   }
 }
 
-
-// =====================
-// MANAGEMENT SEND
-// =====================
 async function sendManagementMessage(content) {
   const channel = await client.channels.fetch(MANAGEMENT_OUTPUT_CHANNEL_ID);
   await channel.send({ content });
@@ -2619,9 +2501,6 @@ async function sendTraining(targetUserId, instructorId, date, issuerId) {
   );
 }
 
-// =====================
-// PERMANENTE NACHRICHTEN
-// =====================
 async function sendOrUpdatePermanentMessage(channelId, key, payload) {
   const channel = await client.channels.fetch(channelId);
   const oldMessageId = await getSetting(key, null);
@@ -2742,9 +2621,6 @@ async function updateWeeklyWorktimeMessage() {
   });
 }
 
-// =====================
-// LOGS
-// =====================
 async function sendTimeLog(type, member, text) {
   const channel = await client.channels.fetch(TIME_LOG_CHANNEL_ID);
 
@@ -2771,9 +2647,6 @@ async function sendTimeLog(type, member, text) {
   await channel.send({ embeds: [embed] });
 }
 
-// =====================
-// SESSION / RANKUP
-// =====================
 async function checkRankup(userId) {
   const employee = await query(`SELECT total_minutes, rankup_notified FROM employees WHERE user_id = $1`, [userId]);
 
@@ -2864,9 +2737,6 @@ async function finishSession(userId, autoClockout = false, forcedEndAt = new Dat
   return { sessionId: inserted.rows[0].id, minutes };
 }
 
-// =====================
-// REMINDER
-// =====================
 async function deleteReminderMessage(session) {
   if (!session?.reminder_message_id) return;
 
@@ -2991,9 +2861,6 @@ async function checkWarningReviewReminders() {
   }
 }
 
-// =====================
-// WOCHENRESET
-// =====================
 function getBerlinParts(date = new Date()) {
   const formatter = new Intl.DateTimeFormat("de-DE", {
     timeZone: "Europe/Berlin",
@@ -3026,9 +2893,6 @@ async function weeklyResetOnly() {
   await updateWeeklyStatisticsMessage().catch(() => null);
 }
 
-// =====================
-// MITARBEITER-ROLLEN-SYNC
-// =====================
 async function syncEmployeeRoles() {
   const guild = await client.guilds.fetch(GUILD_ID);
   const members = await guild.members.fetch();
@@ -3050,11 +2914,6 @@ async function syncEmployeeRoles() {
   await updateWeeklyWorktimeMessage();
   console.log("✅ Mitarbeiter-Rollen wurden synchronisiert.");
 }
-
-
-// =====================
-// DASHBOARD / AKTIVE STÄNDE / PERSONALAKTEN
-// =====================
 
 async function getCleanUserDisplay(userId) {
   try {
@@ -3356,7 +3215,6 @@ async function sendPersonalFileToChannel(userId, requesterId) {
   });
 }
 
-
 async function getEmployeeAnalysis(userId) {
   const employee = await query(`SELECT * FROM employees WHERE user_id = $1`, [userId]);
   const warnings = await query(`SELECT * FROM warning_records WHERE user_id = $1 AND active = TRUE`, [userId]);
@@ -3508,8 +3366,6 @@ async function updateWeeklyStatisticsMessage() {
 }
 
 async function updateManagementTasksMessage() {
-  // Aufgaben sind jetzt direkt im Dashboard integriert.
-  // Diese Funktion bleibt nur bestehen, damit ältere Aufrufe keinen Fehler auslösen.
   return;
 }
 
@@ -3584,10 +3440,6 @@ async function logStockCheck(messageId, userId, status, note = null) {
   ).catch(() => null);
 }
 
-
-// =====================
-// ZEITVERWALTUNG
-// =====================
 function timeActionLabel(action) {
   const labels = {
     add: "Zeit hinzugefügt",
@@ -3764,11 +3616,6 @@ function timeUserSelect(customId, placeholder = "Mitarbeiter auswählen") {
   );
 }
 
-
-
-// =====================
-// BUSINESS-NAMEN VERKNÜPFUNGEN
-// =====================
 function normalizeBusinessName(name) {
   return String(name || "")
     .trim()
@@ -3781,7 +3628,6 @@ function normalizeBusinessName(name) {
     .replace(/\s+/g, " ")
     .trim();
 }
-
 
 function cleanBusinessNameFromMember(member) {
   const raw = String(
@@ -3805,7 +3651,6 @@ function cleanBusinessNameFromMember(member) {
     .replace(/[ ]+/g, " ")
     .trim();
 
-  // Falls jemand z. B. nur einen Rang/Emoji als Nickname hat, lieber nicht automatisch speichern.
   if (!cleaned || cleaned.length < 3 || !cleaned.includes(" ")) return null;
 
   return formatName(cleaned);
@@ -3893,12 +3738,6 @@ async function deleteBusinessUserLink(name) {
   return res.rows[0] || null;
 }
 
-// =====================
-// BUSINESS-ZEITSTEMPEL SCANNER - SCHRITT 2 TEST
-// =====================
-// Aktuell macht dieses System nur einen Test-Scan und schreibt erkannte Daten in die Railway-Logs.
-// Es trägt noch KEINE Zeiten automatisch in die Datenbank ein. Das kommt erst im nächsten Schritt.
-
 function collectEmbedTextForBusinessTimeLog(message) {
   const parts = [];
 
@@ -3926,8 +3765,6 @@ function parseBusinessDurationToMinutes(rawDuration) {
   const minutes = Number((text.match(/(\d+)\s*minuten?/) || [])[1] || 0);
   const seconds = Number((text.match(/(\d+)\s*sekunden?/) || [])[1] || 0);
 
-  // Für deine bestehende Arbeitszeit-Datenbank speichern wir Minuten.
-  // Sekunden werden aufgerundet, damit 4 Min. 36 Sek. als 5 Minuten zählt.
   const totalMinutes = hours * 60 + minutes + (seconds > 0 ? 1 : 0);
   return totalMinutes;
 }
@@ -3972,7 +3809,6 @@ async function importBusinessTimeFromLog(parsed, linkedUser) {
   try {
     await db.query("BEGIN");
 
-    // Erst Import-ID eintragen. Wenn die Message schon verarbeitet wurde, wird nichts doppelt gezählt.
     const importRes = await db.query(
       `
       INSERT INTO business_time_imports (message_id, user_id, name, business_id, duration_minutes, duration_text, raw_text)
@@ -4091,10 +3927,30 @@ client.on("messageCreate", async (message) => {
   }
 });
 
+const BOT_STATUS_ROTATION = [
+  "Made by Kquwi♱",
+  "Anni stinkt 🫰",
+  "Pearls Resort 🌴",
+  "Wer das liest ist süß 🍭",
+];
 
-// =====================
-// READY / STARTUP FIX
-// =====================
+let statusRotationInterval = null;
+let statusRotationIndex = 0;
+
+function startStatusRotation() {
+  if (!client.user) return;
+  if (statusRotationInterval) clearInterval(statusRotationInterval);
+
+  const applyStatus = () => {
+    const status = BOT_STATUS_ROTATION[statusRotationIndex % BOT_STATUS_ROTATION.length];
+    statusRotationIndex++;
+    client.user.setActivity(status);
+  };
+
+  applyStatus();
+  statusRotationInterval = setInterval(applyStatus, 5000);
+}
+
 let botStarted = false;
 
 async function startBotOnce() {
@@ -4109,7 +3965,7 @@ async function startBotOnce() {
 
   try {
     if (client.user) {
-      client.user.setActivity("Made by Kquwi♱");
+      startStatusRotation();
     }
 
     await initDatabase();
@@ -4142,7 +3998,6 @@ async function startBotOnce() {
 client.once("ready", startBotOnce);
 client.once("clientReady", startBotOnce);
 
-// Falls Discord.js ready schon gesetzt hat, aber das Event wegen Hot-Reload/Timing nicht mehr kommt.
 setTimeout(() => {
   if (!botStarted && client.isReady?.()) {
     console.log("ℹ️ Client ist bereits ready. Starte System über Fallback.");
@@ -4150,9 +4005,6 @@ setTimeout(() => {
   }
 }, 5000);
 
-// =====================
-// MEMBER LEAVE
-// =====================
 client.on("guildMemberRemove", async (member) => {
   await deleteEmployeeTimeData(member.id).catch((err) => console.error("❌ Member-Leave Zeitdaten löschen fehlgeschlagen:", err));
   await updateTotalWorktimeMessage().catch(() => null);
@@ -4170,9 +4022,6 @@ client.on("guildMemberAdd", async (member) => {
   );
 });
 
-// =====================
-// MITARBEITER-ROLLE TRACKING
-// =====================
 client.on("guildMemberUpdate", async (oldMember, newMember) => {
   const hadRole = oldMember.roles.cache.has(EMPLOYEE_ROLE_ID);
   const hasRole = newMember.roles.cache.has(EMPLOYEE_ROLE_ID);
@@ -4215,21 +4064,12 @@ client.on("guildMemberUpdate", async (oldMember, newMember) => {
   }
 });
 
-// =====================
-// INTERACTIONS
-// =====================
 client.on("interactionCreate", async (interaction) => {
   try {
-    // =====================
-    // SLASH COMMANDS
-    // =====================
     if (interaction.isChatInputCommand()) {
       const isTicketSlashCommand =
         interaction.commandName.startsWith("ticket-") || interaction.commandName === "ticketclose";
 
-      // Bürger sollen keine normalen Bot-Commands nutzen.
-      // Ticket-Commands lassen wir hier aber durch, damit die Ticket-eigenen Berechtigungen sauber antworten
-      // und Staff/Ersteller im privaten Thread nicht versehentlich blockiert werden.
       if (!isTicketSlashCommand && isRestrictedCitizenCommandUser(interaction.member)) {
         return interaction.reply({
           content: "❌ Bürger können keine Bot-Commands benutzen.",
@@ -4536,8 +4376,6 @@ client.on("interactionCreate", async (interaction) => {
             return;
           }
 
-          // Wichtig: Für geschlossene/archivierte Threads zuerst aus der DB laden.
-          // getOrRecoverTicketFromThread() ist für offene Threads okay, aber bei archivierten Threads kann Discord-Fetch hängen.
           let ticket = await ticketTimeout(getTicketByThread(threadId), 8000, "Ticket aus Datenbank laden").catch((err) => {
             console.error("❌ Ticket-Open DB-Laden fehlgeschlagen:", err?.message || err);
             return null;
@@ -4589,7 +4427,6 @@ client.on("interactionCreate", async (interaction) => {
 
           const restoreName = getOpenTicketName(ticket, thread, getRestoreTicketName(ticket));
 
-          // DB zuerst öffnen. So ist der Ticketstatus sofort korrekt, auch wenn Discord beim Entarchivieren kurz hängt.
           await ticketTimeout(
             query(
               `
@@ -4807,9 +4644,6 @@ client.on("interactionCreate", async (interaction) => {
 
     }
 
-    // =====================
-    // SELECT MENUS
-    // =====================
     if (interaction.isUserSelectMenu()) {
       const id = interaction.customId;
 
@@ -4871,7 +4705,6 @@ client.on("interactionCreate", async (interaction) => {
           ephemeral: true,
         });
       }
-
 
       const map = {
         mgmt_warning_user: "warning",
@@ -4966,12 +4799,7 @@ client.on("interactionCreate", async (interaction) => {
       }
     }
 
-    // =====================
-    // BUTTONS
-    // =====================
     if (interaction.isButton()) {
-      // TICKET-CLOSE BUTTONS GANZ OBEN ABFANGEN
-      // Dadurch lädt "Abbrechen"/"Schließen" nicht ewig, selbst wenn darunter andere Button-Logik länger braucht.
       if (
         interaction.customId.startsWith("ticket_close_confirm_") ||
         interaction.customId.startsWith("ticket_close_cancel_") ||
@@ -4988,7 +4816,6 @@ client.on("interactionCreate", async (interaction) => {
         return handleTicketCloseDecision(interaction, closeToken, decision);
       }
 
-      // ZEITVERWALTUNG START
       if (
         interaction.customId === "time_add_start" ||
         interaction.customId === "time_remove_start" ||
@@ -5080,7 +4907,6 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.showModal(modal);
       }
 
-      // MANAGEMENT START
       if (interaction.customId === "mgmt_warning_start") {
         if (!canManagePersonal(interaction.member)) return interaction.reply({ content: "❌ Du darfst das nicht.", ephemeral: true });
         managementDrafts.set(draftKey(interaction.user.id, "warning"), {});
@@ -5135,7 +4961,6 @@ client.on("interactionCreate", async (interaction) => {
         });
       }
 
-      // MANAGEMENT CONTINUE
       if (interaction.customId === "mgmt_warning_continue") {
         const draft = managementDrafts.get(draftKey(interaction.user.id, "warning"));
         if (!draft?.targetUserId || !draft?.warningRoleId) return interaction.reply({ content: "❌ Bitte User und Verwarnung auswählen.", ephemeral: true });
@@ -5197,7 +5022,6 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.showModal(modal);
       }
 
-      // LEADERBOARD BUTTONS
       if (interaction.customId === "weekly_prev" || interaction.customId === "weekly_next") {
         const current = Number(await getSetting("weekly_page", "0"));
         const next = interaction.customId === "weekly_next" ? current + 1 : current - 1;
@@ -5214,7 +5038,6 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.reply({ content: "✅ Gesamtzeiten aktualisiert.", ephemeral: true });
       }
 
-      // CLOCK BUTTONS
       if (interaction.customId === "clock_in") {
         if (!interaction.member.roles.cache.has(EMPLOYEE_ROLE_ID)) {
           return interaction.reply({ content: "❌ Du kannst dich nur einstempeln, wenn du die Mitarbeiter-Rolle hast.", ephemeral: true });
@@ -5353,7 +5176,6 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.showModal(modal);
       }
 
-      // MITARBEITER PANEL BUTTONS
       if (interaction.customId.startsWith("ticket_open_")) {
         const categoryKey = interaction.customId.replace("ticket_open_", "");
         return createTicketFromButton(interaction, categoryKey);
@@ -5482,7 +5304,6 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.reply({ content: confirmed ? "✅ Buchung wurde bestätigt und in den gebuchten Channel geschickt." : "❌ Buchung wurde abgelehnt.", ephemeral: true });
       }
 
-      // STATUS BUTTONS
       if (interaction.customId === "stock_checked") {
         if (!hasManagerRole(interaction.member)) {
           return interaction.reply({ content: "❌ Nur Manager können die Lagerprüfung bestätigen.", ephemeral: true });
@@ -5629,9 +5450,6 @@ client.on("interactionCreate", async (interaction) => {
       }
     }
 
-    // =====================
-    // MODALS
-    // =====================
     if (interaction.isModalSubmit()) {
       if (interaction.customId.startsWith("time_manage_modal_")) {
         if (!canManagePersonal(interaction.member)) {
@@ -5742,7 +5560,6 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.reply({ content: "✅ Deine Essensstand-Buchung wurde gesendet.", ephemeral: true });
       }
 
-      // MANAGEMENT MODALS
       if (interaction.customId === "mgmt_warning_modal") {
         const draft = managementDrafts.get(draftKey(interaction.user.id, "warning"));
         if (!draft?.targetUserId || !draft?.warningRoleId) return interaction.reply({ content: "❌ Entwurf nicht gefunden. Bitte neu starten.", ephemeral: true });
@@ -5773,7 +5590,6 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.reply({ content: "✅ Einweisung wurde dokumentiert.", ephemeral: true });
       }
 
-      // CORRECTION MODAL
       if (interaction.customId.startsWith("correct_time_modal_")) {
         const parts = interaction.customId.split("_");
         const sessionId = parts[3];
@@ -5804,7 +5620,6 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       if (interaction.customId === "registration_modal") {
-        // Registrierung: Nickname setzen, Rollen vergeben und Zeitliste aktualisieren
         const firstName = formatName(interaction.fields.getTextInputValue("registration_firstname"));
         const lastName = formatName(interaction.fields.getTextInputValue("registration_lastname"));
         const fullName = `${firstName} ${lastName}`;
@@ -5834,10 +5649,6 @@ client.on("interactionCreate", async (interaction) => {
           roleText = "\n✅ Alle Registrierungsrollen wurden vergeben.";
         }
 
-        // Gäste werden bei der Registrierung nicht automatisch als Mitarbeiter angelegt.
-        // In die Zeitlisten kommt ein User erst, wenn er später die Mitarbeiter-Rolle erhält
-        // oder sich mit Mitarbeiter-Rolle einstempelt.
-
         return interaction.reply({
           content: `✅ Registrierung abgeschlossen.
 ${nicknameText}${roleText}`,
@@ -5845,7 +5656,6 @@ ${nicknameText}${roleText}`,
         });
       }
 
-      // MITARBEITER MODALS
       if (interaction.customId === "absence_modal") {
         const name = interaction.fields.getTextInputValue("absence_name");
         const fromRaw = interaction.fields.getTextInputValue("absence_from");
