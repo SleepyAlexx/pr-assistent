@@ -383,6 +383,17 @@ async function initDatabase() {
   `);
 
   await query(`
+    CREATE TABLE IF NOT EXISTS business_user_links (
+      business_id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      linked_by TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await query(`
     CREATE TABLE IF NOT EXISTS warning_records (
       id SERIAL PRIMARY KEY,
       user_id TEXT NOT NULL,
@@ -627,6 +638,42 @@ async function registerCommands() {
         option
           .setName("user")
           .setDescription("Mitarbeiter auswählen")
+          .setRequired(true)
+      ),
+
+    new SlashCommandBuilder()
+      .setName("business-link")
+      .setDescription("Verknüpft eine Business-ID mit einem Discord-User.")
+      .addUserOption((option) =>
+        option
+          .setName("user")
+          .setDescription("Discord-User auswählen")
+          .setRequired(true)
+      )
+      .addIntegerOption((option) =>
+        option
+          .setName("business_id")
+          .setDescription("Business-ID aus dem Zeitstempel-Log")
+          .setRequired(true)
+      )
+      .addStringOption((option) =>
+        option
+          .setName("name")
+          .setDescription("Name aus dem Business-System, z. B. Florian Müller")
+          .setRequired(true)
+      ),
+
+    new SlashCommandBuilder()
+      .setName("business-links")
+      .setDescription("Zeigt alle Business-ID-Verknüpfungen an."),
+
+    new SlashCommandBuilder()
+      .setName("business-unlink")
+      .setDescription("Löscht eine Business-ID-Verknüpfung.")
+      .addIntegerOption((option) =>
+        option
+          .setName("business_id")
+          .setDescription("Business-ID, die entfernt werden soll")
           .setRequired(true)
       ),
 
@@ -3688,6 +3735,64 @@ function timeUserSelect(customId, placeholder = "Mitarbeiter auswählen") {
 }
 
 
+
+// =====================
+// BUSINESS-ID VERKNÜPFUNGEN
+// =====================
+async function upsertBusinessUserLink(businessId, userId, name, linkedBy) {
+  const cleanBusinessId = String(businessId).trim();
+  const cleanName = String(name || "").trim();
+
+  await ensureEmployee(userId).catch(() => null);
+
+  const res = await query(
+    `
+    INSERT INTO business_user_links (business_id, user_id, name, linked_by)
+    VALUES ($1, $2, $3, $4)
+    ON CONFLICT (business_id)
+    DO UPDATE SET user_id = EXCLUDED.user_id,
+                  name = EXCLUDED.name,
+                  linked_by = EXCLUDED.linked_by,
+                  updated_at = NOW()
+    RETURNING *;
+    `,
+    [cleanBusinessId, userId, cleanName, linkedBy]
+  );
+
+  return res.rows[0];
+}
+
+async function getBusinessUserLink(businessId) {
+  const res = await query(
+    `SELECT * FROM business_user_links WHERE business_id = $1 LIMIT 1`,
+    [String(businessId).trim()]
+  ).catch(() => ({ rows: [] }));
+
+  return res.rows[0] || null;
+}
+
+async function listBusinessUserLinks() {
+  const res = await query(
+    `
+    SELECT *
+    FROM business_user_links
+    ORDER BY updated_at DESC
+    LIMIT 50;
+    `
+  ).catch(() => ({ rows: [] }));
+
+  return res.rows;
+}
+
+async function deleteBusinessUserLink(businessId) {
+  const res = await query(
+    `DELETE FROM business_user_links WHERE business_id = $1 RETURNING *`,
+    [String(businessId).trim()]
+  ).catch(() => ({ rows: [] }));
+
+  return res.rows[0] || null;
+}
+
 // =====================
 // BUSINESS-ZEITSTEMPEL SCANNER - SCHRITT 2 TEST
 // =====================
@@ -3754,84 +3859,43 @@ client.on("messageCreate", async (message) => {
   try {
     if (!message.guildId || message.channelId !== BUSINESS_TIME_LOG_CHANNEL_ID) return;
 
-    // Wichtig: Zeitstempel kommen sehr wahrscheinlich von einem anderen Bot.
-    // Deshalb ignorieren wir NICHT pauschal alle Bot-Nachrichten, sondern nur unsere eigenen.
-    if (client.user?.id && message.author?.id === client.user.id) return;
-
-    const rawText = collectEmbedTextForBusinessTimeLog(message);
+    const parsed = parseBusinessTimeLogMessage(message);
 
     console.log("📩 Neue Nachricht im Business-Zeitlog-Channel erkannt:", {
       messageId: message.id,
-      authorTag: message.author?.tag || "unbekannt",
-      authorId: message.author?.id || "unbekannt",
+      authorId: message.author?.id,
       authorIsBot: Boolean(message.author?.bot),
       contentLength: message.content?.length || 0,
       embedCount: message.embeds?.length || 0,
-      preview: rawText ? rawText.slice(0, 500) : "KEIN TEXT / KEIN EMBED-TEXT ERKANNT",
+      preview: businessMessageText(message).slice(0, 700),
     });
-
-    const parsed = parseBusinessTimeLogMessage(message);
 
     if (!parsed) {
       console.log("⚠️ Business-Zeitlog konnte noch nicht geparst werden. Parser muss an das genaue Format angepasst werden.");
       return;
     }
 
+    const linkedUser = await getBusinessUserLink(parsed.businessId);
+
     console.log("✅ Business-Zeitlog erkannt:", {
-      messageId: parsed.messageId,
-      name: parsed.employeeName,
+      name: parsed.name,
       businessId: parsed.businessId,
       action: parsed.action,
       durationText: parsed.durationText,
       durationMinutes: parsed.durationMinutes,
+      linkedDiscordUserId: linkedUser?.user_id || null,
     });
+
+    if (!linkedUser) {
+      console.log(`ℹ️ Business-ID ${parsed.businessId} ist noch nicht verknüpft. Nutze /business-link user:@User business_id:${parsed.businessId} name:${parsed.name}`);
+      return;
+    }
+
+    // Schritt 3 ist nur die Verknüpfung. Zeiten werden noch NICHT automatisch eingetragen.
+    // Das machen wir erst im nächsten Schritt, sobald die Links sauber getestet wurden.
   } catch (err) {
     console.error("❌ Fehler beim Business-Zeitlog-Testscanner:", err);
   }
-});
-
-// =====================
-// READY
-// =====================
-client.once("clientReady", async () => {
-  console.log(`✅ Bot ist online als ${client.user.tag}`);
-  client.user.setActivity("Made by Kquwi✞");
-
-  try {
-    await initDatabase();
-    await registerCommands();
-    await syncEmployeeRoles();
-    await updateTotalWorktimeMessage();
-    await updateWeeklyWorktimeMessage();
-    await updateDashboardMessage();
-    await updateWeeklyStatisticsMessage();
-    await updateManagementTasksMessage();
-    await sendStockCheckReminderIfNeeded(true);
-
-    setInterval(checkReminders, 60 * 1000);
-    setInterval(updateTotalWorktimeMessage, 2 * 60 * 1000);
-    setInterval(updateWeeklyWorktimeMessage, 2 * 60 * 1000);
-    setInterval(updateDashboardMessage, 2 * 60 * 1000);
-    setInterval(updateWeeklyStatisticsMessage, 5 * 60 * 1000);
-    setInterval(updateManagementTasksMessage, 5 * 60 * 1000);
-    setInterval(sendStockCheckReminderIfNeeded, 60 * 1000);
-    setInterval(weeklyResetOnly, 60 * 1000);
-    setInterval(checkTicketCloseDeadlines, 60 * 1000);
-    setInterval(checkWarningReviewReminders, 60 * 60 * 1000);
-
-    console.log("✅ Stempel-Uhr System gestartet.");
-  } catch (err) {
-    console.error("❌ Fehler beim Start:", err);
-  }
-});
-
-// =====================
-// MEMBER LEAVE
-// =====================
-client.on("guildMemberRemove", async (member) => {
-  await deleteEmployeeTimeData(member.id);
-  await updateTotalWorktimeMessage();
-  await updateWeeklyWorktimeMessage();
 });
 
 client.on("guildMemberAdd", async (member) => {
@@ -4292,6 +4356,97 @@ client.on("interactionCreate", async (interaction) => {
           }).catch(() => null);
           return;
         }
+      }
+
+      if (interaction.commandName === "business-link") {
+        await interaction.deferReply({ ephemeral: true }).catch(() => null);
+
+        if (!canManagePersonal(interaction.member)) {
+          await interaction.editReply({ content: "❌ Du darfst Business-IDs nicht verknüpfen." }).catch(() => null);
+          return;
+        }
+
+        const targetUser = interaction.options.getUser("user", true);
+        const businessId = interaction.options.getInteger("business_id", true);
+        const name = interaction.options.getString("name", true).trim();
+
+        if (!name || name.length < 2) {
+          await interaction.editReply({ content: "❌ Bitte gib einen gültigen Namen an." }).catch(() => null);
+          return;
+        }
+
+        const saved = await upsertBusinessUserLink(businessId, targetUser.id, name, interaction.user.id).catch((err) => {
+          console.error("❌ Business-Link konnte nicht gespeichert werden:", err);
+          return null;
+        });
+
+        if (!saved) {
+          await interaction.editReply({ content: "❌ Die Verknüpfung konnte nicht gespeichert werden. Schau bitte in die Railway Logs." }).catch(() => null);
+          return;
+        }
+
+        await interaction.editReply({
+          content:
+            "✅ **Business-ID verknüpft**\n\n" +
+            `Business-ID: **${saved.business_id}**\n` +
+            `Name: **${saved.name}**\n` +
+            `Discord-User: <@${saved.user_id}>\n\n` +
+            "Beim nächsten Zeitlog erkennt der Scanner jetzt den passenden Discord-User.",
+        }).catch(() => null);
+        return;
+      }
+
+      if (interaction.commandName === "business-links") {
+        await interaction.deferReply({ ephemeral: true }).catch(() => null);
+
+        if (!canManagePersonal(interaction.member)) {
+          await interaction.editReply({ content: "❌ Du darfst Business-Verknüpfungen nicht ansehen." }).catch(() => null);
+          return;
+        }
+
+        const links = await listBusinessUserLinks();
+
+        if (!links.length) {
+          await interaction.editReply({ content: "📭 Es gibt noch keine Business-ID-Verknüpfungen. Nutze `/business-link`." }).catch(() => null);
+          return;
+        }
+
+        const lines = links.map((link, index) => {
+          return `${index + 1}. **${link.business_id}** → <@${link.user_id}> | ${link.name}`;
+        });
+
+        await interaction.editReply({
+          content:
+            "📋 **Business-ID-Verknüpfungen**\n\n" +
+            lines.join("\n")
+        }).catch(() => null);
+        return;
+      }
+
+      if (interaction.commandName === "business-unlink") {
+        await interaction.deferReply({ ephemeral: true }).catch(() => null);
+
+        if (!canManagePersonal(interaction.member)) {
+          await interaction.editReply({ content: "❌ Du darfst Business-Verknüpfungen nicht löschen." }).catch(() => null);
+          return;
+        }
+
+        const businessId = interaction.options.getInteger("business_id", true);
+        const deleted = await deleteBusinessUserLink(businessId);
+
+        if (!deleted) {
+          await interaction.editReply({ content: `⚠️ Für Business-ID **${businessId}** wurde keine Verknüpfung gefunden.` }).catch(() => null);
+          return;
+        }
+
+        await interaction.editReply({
+          content:
+            "✅ **Business-Verknüpfung gelöscht**\n\n" +
+            `Business-ID: **${deleted.business_id}**\n` +
+            `Vorheriger User: <@${deleted.user_id}>\n` +
+            `Name: **${deleted.name}**`,
+        }).catch(() => null);
+        return;
       }
 
       if (interaction.commandName === "dashboard") {
