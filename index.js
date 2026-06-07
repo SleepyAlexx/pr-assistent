@@ -568,6 +568,17 @@ async function registerCommands() {
           .setRequired(false)
       ),
 
+    // Alias ohne Bindestrich, falls man /ticketopen eingibt
+    new SlashCommandBuilder()
+      .setName("ticketopen")
+      .setDescription("Öffnet ein archiviertes/geschlossenes Ticket wieder.")
+      .addStringOption((option) =>
+        option
+          .setName("thread_id")
+          .setDescription("Optional: Thread-ID, wenn du den Command außerhalb des Tickets nutzt")
+          .setRequired(false)
+      ),
+
     new SlashCommandBuilder()
       .setName("dashboard")
       .setDescription("Aktualisiert das Live-Dashboard."),
@@ -1618,6 +1629,98 @@ function safeThreadUnarchiveUnlock(thread, reason = "Ticket freigeben") {
       console.error("⚠️ Thread entsperren fehlgeschlagen:", err?.message || err);
     });
   }, 250);
+}
+
+
+async function fetchTicketThreadForOpen(threadId, categoryKey = null) {
+  if (!threadId) return null;
+
+  // 1) Direkt über den Discord-Client versuchen.
+  let thread = await ticketTimeout(
+    client.channels.fetch(threadId, { force: true }),
+    8000,
+    "Ticket-Thread direkt laden"
+  ).catch((err) => {
+    console.error("⚠️ Ticket-Open: direkter Thread-Fetch fehlgeschlagen:", err?.message || err);
+    return null;
+  });
+
+  if (thread?.isThread?.()) return thread;
+
+  // 2) Über den Elternkanal der Ticket-Kategorie versuchen.
+  const category = categoryKey ? TICKET_CATEGORIES[categoryKey] : null;
+  const parentIds = category?.channelId
+    ? [category.channelId]
+    : Object.values(TICKET_CATEGORIES).map((cat) => cat.channelId);
+
+  for (const parentId of [...new Set(parentIds)]) {
+    const parent = await ticketTimeout(
+      client.channels.fetch(parentId, { force: true }),
+      8000,
+      `Ticket-Elternkanal laden ${parentId}`
+    ).catch((err) => {
+      console.error(`⚠️ Ticket-Open: Parent-Fetch fehlgeschlagen (${parentId}):`, err?.message || err);
+      return null;
+    });
+
+    if (!parent?.threads?.fetch) continue;
+
+    thread = await ticketTimeout(
+      parent.threads.fetch(threadId),
+      8000,
+      `Ticket-Thread über Parent laden ${parentId}`
+    ).catch((err) => {
+      console.error(`⚠️ Ticket-Open: Parent-Thread-Fetch fehlgeschlagen (${parentId}):`, err?.message || err);
+      return null;
+    });
+
+    if (thread?.isThread?.()) return thread;
+  }
+
+  return null;
+}
+
+function scheduleTicketOpenFinalization(threadId, ticket, actorId, restoreName) {
+  setTimeout(async () => {
+    console.log(`🔓 Ticket-Open-Finalisierung gestartet: ${threadId}`);
+
+    const thread = await fetchTicketThreadForOpen(threadId, ticket?.category).catch((err) => {
+      console.error("❌ Ticket-Open-Finalisierung: Thread konnte nicht geladen werden:", err?.message || err);
+      return null;
+    });
+
+    if (!thread?.isThread?.()) {
+      console.error("❌ Ticket-Open-Finalisierung abgebrochen: Thread nicht gefunden", threadId);
+      return;
+    }
+
+    await ticketTimeout(thread.setArchived(false, "Ticket wieder geöffnet"), 8000, "Ticket entarchivieren").catch((err) => {
+      console.error("⚠️ Ticket-Open: Entarchivieren fehlgeschlagen:", err?.message || err);
+    });
+
+    await ticketTimeout(thread.setLocked(false, "Ticket wieder geöffnet"), 8000, "Ticket entsperren").catch((err) => {
+      console.error("⚠️ Ticket-Open: Entsperren fehlgeschlagen:", err?.message || err);
+    });
+
+    await ticketTimeout(
+      thread.send({
+        content:
+          `@everyone\n\n` +
+          `🔓 ・**TICKET WIEDER GEÖFFNET**\n\n` +
+          `<@${actorId}> hat dieses Ticket wieder geöffnet.`,
+        allowedMentions: { parse: ["everyone"], users: [actorId] },
+      }),
+      8000,
+      "Ticket-Open Nachricht senden"
+    ).catch((err) => {
+      console.error("⚠️ Ticket-Open: Öffentliche Nachricht konnte nicht gesendet werden:", err?.message || err);
+    });
+
+    safeThreadRename(thread, restoreName, `Ticket wieder geöffnet von ${actorId}`, "Ticket beim Öffnen umbenennen");
+    scheduleTicketStaffAutoAdd(thread.id, ticket.category, 1200);
+
+    console.log(`✅ Ticket-Open-Finalisierung beendet: ${threadId}`);
+  }, 300);
 }
 
 function scheduleTicketArchiveFinalization(thread, closedName) {
@@ -3779,66 +3882,111 @@ client.on("interactionCreate", async (interaction) => {
         return requestTicketClose(interaction);
       }
 
-      if (interaction.commandName === "ticket-open") {
-        await interaction.deferReply({ ephemeral: false });
+      if (interaction.commandName === "ticket-open" || interaction.commandName === "ticketopen") {
+        await interaction.deferReply({ ephemeral: true }).catch(() => null);
 
-        const givenThreadId = interaction.options.getString("thread_id", false);
-        const thread = givenThreadId
-          ? await client.channels.fetch(givenThreadId).catch(() => null)
-          : interaction.channel;
+        try {
+          const givenThreadId = interaction.options.getString("thread_id", false);
+          const currentThread = interaction.channel?.isThread?.() ? interaction.channel : null;
+          const threadId = givenThreadId || currentThread?.id;
 
-        if (!thread?.isThread?.()) {
-          await interaction.editReply({ content: "❌ Nutze den Command direkt im Ticket-Thread oder gib `thread_id:` an." });
+          if (!threadId) {
+            await interaction.editReply({
+              content: "❌ Nutze den Command direkt im Ticket-Thread oder gib `thread_id:` an.",
+            }).catch(() => null);
+            return;
+          }
+
+          // Wichtig: Für geschlossene/archivierte Threads zuerst aus der DB laden.
+          // getOrRecoverTicketFromThread() ist für offene Threads okay, aber bei archivierten Threads kann Discord-Fetch hängen.
+          let ticket = await ticketTimeout(getTicketByThread(threadId), 8000, "Ticket aus Datenbank laden").catch((err) => {
+            console.error("❌ Ticket-Open DB-Laden fehlgeschlagen:", err?.message || err);
+            return null;
+          });
+
+          let thread = currentThread;
+
+          if (!ticket) {
+            thread = await fetchTicketThreadForOpen(threadId).catch(() => null);
+            if (thread?.isThread?.()) {
+              ticket = await ticketTimeout(getOrRecoverTicketFromThread(thread), 8000, "Ticket aus Thread wiederherstellen").catch((err) => {
+                console.error("❌ Ticket-Open Recovery fehlgeschlagen:", err?.message || err);
+                return null;
+              });
+            }
+          }
+
+          if (!ticket) {
+            await interaction.editReply({
+              content: "❌ Dieses Ticket wurde nicht in der Datenbank gefunden. Prüfe, ob die Thread-ID stimmt.",
+            }).catch(() => null);
+            return;
+          }
+
+          if (ticket.status === "deleted") {
+            await interaction.editReply({
+              content: "❌ Dieses Ticket ist bereits als gelöscht markiert und kann nicht mehr geöffnet werden.",
+            }).catch(() => null);
+            return;
+          }
+
+          if (!canUseTicketStaffCommands(interaction.member, ticket.category)) {
+            await interaction.editReply({ content: "❌ Du darfst dieses Ticket nicht wieder öffnen." }).catch(() => null);
+            return;
+          }
+
+          if (!thread?.isThread?.()) {
+            thread = await fetchTicketThreadForOpen(threadId, ticket.category).catch(() => null);
+          }
+
+          if (!thread?.isThread?.()) {
+            await interaction.editReply({
+              content:
+                "❌ Der Ticket-Thread konnte bei Discord nicht geladen werden. " +
+                "Prüfe bitte, ob die Thread-ID stimmt und ob der Bot Zugriff auf den Ticket-Bereich hat.",
+            }).catch(() => null);
+            return;
+          }
+
+          const restoreName = getRestoreTicketName(ticket);
+
+          // DB zuerst öffnen. So ist der Ticketstatus sofort korrekt, auch wenn Discord beim Entarchivieren kurz hängt.
+          await ticketTimeout(
+            query(
+              `
+              UPDATE ticket_records
+              SET status = 'open',
+                  current_name = $2,
+                  close_requested_by = NULL,
+                  close_requested_at = NULL,
+                  close_deadline_at = NULL,
+                  close_message_id = NULL,
+                  delete_after_at = NULL,
+                  updated_at = NOW()
+              WHERE thread_id = $1
+              `,
+              [threadId, restoreName]
+            ),
+            8000,
+            "Ticket-Open DB-Update"
+          ).catch((err) => console.error("❌ Ticket-Open DB-Update fehlgeschlagen:", err?.message || err));
+
+          await interaction.editReply({
+            content:
+              `✅ Ticket wird wieder geöffnet.\n` +
+              `Thread: <#${threadId}>\n` +
+              `Ich entarchiviere/entsperre den Thread jetzt im Hintergrund und hole die Teammitglieder wieder rein.`,
+          }).catch(() => null);
+
+          scheduleTicketOpenFinalization(threadId, ticket, interaction.user.id, restoreName);
+          return;
+        } catch (err) {
+          console.error("❌ Fehler bei /ticket-open:", err);
+          await interaction.editReply({
+            content: "❌ Beim Wiederöffnen ist ein Fehler passiert. Schau bitte in die Railway Logs.",
+          }).catch(() => null);
           return;
         }
-
-        const ticket = await getOrRecoverTicketFromThread(thread);
-        if (!ticket) {
-          await interaction.editReply({ content: "❌ Dieses Ticket wurde nicht gefunden." });
-          return;
-        }
-
-        if (!canUseTicketStaffCommands(interaction.member, ticket.category)) {
-          await interaction.editReply({ content: "❌ Du darfst dieses Ticket nicht wieder öffnen." });
-          return;
-        }
-
-        const restoreName = getRestoreTicketName(ticket);
-
-        await thread.setArchived(false, "Ticket wieder geöffnet").catch((err) => {
-          console.error("❌ Ticket konnte nicht entarchiviert werden:", err?.message || err);
-        });
-        await thread.setLocked(false, "Ticket wieder geöffnet").catch((err) => {
-          console.error("❌ Ticket konnte nicht entsperrt werden:", err?.message || err);
-        });
-        // Rename nicht blockierend ausführen, damit /ticket-open nicht hängen bleibt.
-        safeThreadRename(thread, restoreName, `Ticket wieder geöffnet von ${interaction.user.tag}`, "Ticket beim Öffnen umbenennen");
-
-        await query(
-          `
-          UPDATE ticket_records
-          SET status = 'open',
-              current_name = $2,
-              close_requested_by = NULL,
-              close_requested_at = NULL,
-              close_deadline_at = NULL,
-              close_message_id = NULL,
-              delete_after_at = NULL,
-              updated_at = NOW()
-          WHERE thread_id = $1
-          `,
-          [thread.id, restoreName]
-        ).catch((err) => console.error("❌ Ticket-Open DB-Update fehlgeschlagen:", err));
-
-        await thread.send({
-          content: `@everyone\n\n🔓 ・TICKET WIEDER GEÖFFNET\n\n<@${interaction.user.id}> hat dieses Ticket wieder geöffnet.`,
-          allowedMentions: { parse: ["everyone"], users: [interaction.user.id] },
-        }).catch(() => null);
-
-        scheduleTicketStaffAutoAdd(thread.id, ticket.category, 1000);
-
-        await interaction.editReply({ content: `🔓 <@${interaction.user.id}> hat das Ticket wieder geöffnet. Teammitglieder werden im Hintergrund erneut hinzugefügt.` });
-        return;
       }
 
       if (interaction.commandName === "dashboard") {
