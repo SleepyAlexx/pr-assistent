@@ -98,6 +98,7 @@ const PERSONAL_FILES_CHANNEL_ID = "1512314182299816049";
 const STATISTICS_WEEKLY_CHANNEL_ID = "1512314182299816050";
 const MANAGER_CHAT_CHANNEL_ID = "1512314181259366547";
 const STOCK_CHECK_REMINDER_CHANNEL_ID = "1512314181259366549";
+const BUSINESS_TIME_LOG_CHANNEL_ID = "1512314180752117934";
 const TICKET_DEBUG_CHANNEL_ID = "1512779121170714695";
 
 const BOOKING_REQUEST_CHANNEL_ID = "1512409329771221075";
@@ -155,7 +156,7 @@ const pool = new Pool({
 });
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages],
 });
 
 const managementDrafts = new Map();
@@ -3668,6 +3669,90 @@ function timeUserSelect(customId, placeholder = "Mitarbeiter auswählen") {
       .setMaxValues(1)
   );
 }
+
+
+// =====================
+// BUSINESS-ZEITSTEMPEL SCANNER - SCHRITT 2 TEST
+// =====================
+// Aktuell macht dieses System nur einen Test-Scan und schreibt erkannte Daten in die Railway-Logs.
+// Es trägt noch KEINE Zeiten automatisch in die Datenbank ein. Das kommt erst im nächsten Schritt.
+
+function collectEmbedTextForBusinessTimeLog(message) {
+  const parts = [];
+
+  if (message.content) parts.push(message.content);
+
+  for (const embed of message.embeds || []) {
+    if (embed.title) parts.push(embed.title);
+    if (embed.description) parts.push(embed.description);
+    if (embed.footer?.text) parts.push(embed.footer.text);
+
+    for (const field of embed.fields || []) {
+      if (field.name) parts.push(field.name);
+      if (field.value) parts.push(field.value);
+    }
+  }
+
+  return parts.join("\n");
+}
+
+function parseBusinessDurationToMinutes(rawDuration) {
+  if (!rawDuration) return null;
+
+  const text = String(rawDuration).toLowerCase();
+  const hours = Number((text.match(/(\d+)\s*stunden?/) || [])[1] || 0);
+  const minutes = Number((text.match(/(\d+)\s*minuten?/) || [])[1] || 0);
+  const seconds = Number((text.match(/(\d+)\s*sekunden?/) || [])[1] || 0);
+
+  // Für deine bestehende Arbeitszeit-Datenbank speichern wir Minuten.
+  // Sekunden werden aufgerundet, damit 4 Min. 36 Sek. als 5 Minuten zählt.
+  const totalMinutes = hours * 60 + minutes + (seconds > 0 ? 1 : 0);
+  return totalMinutes;
+}
+
+function parseBusinessTimeLogMessage(message) {
+  const text = collectEmbedTextForBusinessTimeLog(message);
+  if (!text || !text.toLowerCase().includes("business zeitstempel")) return null;
+
+  const employeeMatch = text.match(/Der\s+Mitarbeiter\s+(.+?)\s*\(ID:\s*(\d+)\)\s+hat\s+sich\s+(eingestempelt|ausgestempelt)/i);
+  if (!employeeMatch) return null;
+
+  const durationMatch = text.match(/Dauer:\s*([^\n]+)/i);
+  const action = employeeMatch[3].toLowerCase();
+  const durationText = durationMatch ? durationMatch[1].trim() : null;
+
+  return {
+    messageId: message.id,
+    channelId: message.channelId,
+    employeeName: employeeMatch[1].trim(),
+    businessId: employeeMatch[2].trim(),
+    action,
+    durationText,
+    durationMinutes: action === "ausgestempelt" ? parseBusinessDurationToMinutes(durationText) : null,
+    rawText: text.slice(0, 1500),
+  };
+}
+
+client.on("messageCreate", async (message) => {
+  try {
+    if (!message.guildId || message.channelId !== BUSINESS_TIME_LOG_CHANNEL_ID) return;
+    if (client.user?.id && message.author?.id === client.user.id) return;
+
+    const parsed = parseBusinessTimeLogMessage(message);
+    if (!parsed) return;
+
+    console.log("✅ Business-Zeitlog erkannt:", {
+      messageId: parsed.messageId,
+      name: parsed.employeeName,
+      businessId: parsed.businessId,
+      action: parsed.action,
+      durationText: parsed.durationText,
+      durationMinutes: parsed.durationMinutes,
+    });
+  } catch (err) {
+    console.error("❌ Fehler beim Business-Zeitlog-Testscanner:", err);
+  }
+});
 
 // =====================
 // READY
