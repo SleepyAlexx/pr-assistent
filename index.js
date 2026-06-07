@@ -162,7 +162,7 @@ const pool = new Pool({
 });
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
 });
 
 const managementDrafts = new Map();
@@ -3753,10 +3753,29 @@ function parseBusinessTimeLogMessage(message) {
 client.on("messageCreate", async (message) => {
   try {
     if (!message.guildId || message.channelId !== BUSINESS_TIME_LOG_CHANNEL_ID) return;
+
+    // Wichtig: Zeitstempel kommen sehr wahrscheinlich von einem anderen Bot.
+    // Deshalb ignorieren wir NICHT pauschal alle Bot-Nachrichten, sondern nur unsere eigenen.
     if (client.user?.id && message.author?.id === client.user.id) return;
 
+    const rawText = collectEmbedTextForBusinessTimeLog(message);
+
+    console.log("📩 Neue Nachricht im Business-Zeitlog-Channel erkannt:", {
+      messageId: message.id,
+      authorTag: message.author?.tag || "unbekannt",
+      authorId: message.author?.id || "unbekannt",
+      authorIsBot: Boolean(message.author?.bot),
+      contentLength: message.content?.length || 0,
+      embedCount: message.embeds?.length || 0,
+      preview: rawText ? rawText.slice(0, 500) : "KEIN TEXT / KEIN EMBED-TEXT ERKANNT",
+    });
+
     const parsed = parseBusinessTimeLogMessage(message);
-    if (!parsed) return;
+
+    if (!parsed) {
+      console.log("⚠️ Business-Zeitlog konnte noch nicht geparst werden. Parser muss an das genaue Format angepasst werden.");
+      return;
+    }
 
     console.log("✅ Business-Zeitlog erkannt:", {
       messageId: parsed.messageId,
