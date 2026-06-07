@@ -1257,161 +1257,168 @@ async function sendTicketDebugLog(message) {
   await channel.send({ content: message.slice(0, 1900) }).catch(() => null);
 }
 
-async function fetchAllGuildMembersForTickets(guild) {
-  // Wichtig: Keine Query-Suche nutzen. Ohne Parameter lädt discord.js alle Server-Mitglieder.
-  // Dafür muss im Developer Portal der SERVER MEMBERS INTENT aktiv sein und der Bot neu deployed sein.
-  try {
-    const members = await guild.members.fetch();
-    return { members, source: "guild.members.fetch()", error: null };
-  } catch (err) {
-    console.error("❌ guild.members.fetch() ist fehlgeschlagen:", err);
+async function fetchCachedGuildMembersForTickets(guild, roleIds) {
+  // Robust-Fix: KEIN guild.members.fetch() mehr.
+  // Der alte Code hat bei jedem Ticket alle Server-Mitglieder geladen und dadurch Discord-Rate-Limits ausgelöst.
+  // Private Threads können keine Rollen direkt bekommen; Discord erlaubt nur einzelne Mitglieder.
+  // Deshalb nutzen wir nur den vorhandenen Member-Cache und blockieren den Ticket-Ablauf nicht mehr.
+  const members = guild.members.cache.filter((member) => {
+    if (!member || member.user?.bot) return false;
+    return memberHasAnyRole(member, roleIds);
+  });
 
-    // Fallback: Falls Discord nicht alle Mitglieder liefert, nutzen wir wenigstens den aktuellen Cache.
-    // Das ist nicht perfekt, aber verhindert, dass komplett 0 Leute gefunden werden.
-    return { members: guild.members.cache, source: "guild.members.cache (Fallback)", error: err };
-  }
+  return {
+    members,
+    source: "guild.members.cache (kein Full-Fetch, kein Rate-Limit)",
+    error: null,
+  };
 }
 
 async function addAllowedStaffToThread(thread, categoryKey) {
-  const guild = await client.guilds.fetch(GUILD_ID);
-
-  await thread.join().catch((err) => {
-    console.error("⚠️ Bot konnte dem Ticket-Thread nicht beitreten:", err?.message || err);
-  });
-
-  const allowedRoles = ticketAutoAddRoles(categoryKey);
-  const removedUserIds = await getRemovedTicketUserIds(thread.id);
-  const fetchResult = await fetchAllGuildMembersForTickets(guild);
-  const members = fetchResult.members;
-
-  if (!members || members.size === 0) {
-    await sendTicketDebugLog(
-      `❌ **Ticket-Debug** (${categoryKey})\n` +
-      `Es konnten keine Mitglieder geladen werden.\n\n` +
-      `Quelle: **${fetchResult.source}**\n` +
-      (fetchResult.error
-        ? `Fehler: \`${fetchResult.error?.code || "NO_CODE"}: ${String(fetchResult.error?.message || fetchResult.error).slice(0, 900)}\``
-        : `Kein genauer Fehler vorhanden.`) +
-      `\n\nBitte prüfen: SERVER MEMBERS INTENT aktiv, Bot neu deployed, Bot-Rolle hoch genug.`
-    );
-    return { added: 0, failed: 0, found: 0 };
-  }
-
-  const roleCounts = allowedRoles.map((roleId) => {
-    const role = guild.roles.cache.get(roleId);
-    const count = members.filter((member) => !member.user.bot && member.roles.cache.has(roleId)).size;
-    return `${role ? role.name : roleId}: ${count}`;
-  });
-
-  const candidates = members.filter((member) => {
-    if (!member || member.user?.bot) return false;
-    if (removedUserIds.has(member.id)) return false;
-    return memberHasAnyRole(member, allowedRoles);
-  });
-
-  const added = [];
-  const failed = [];
-
-  for (const [, member] of candidates) {
-    try {
-      // Direkt vor dem Hinzufügen erneut prüfen, damit entfernte User nicht durch spätere Auto-Adds wieder reinkommen.
-      if (await isTicketUserRemoved(thread.id, member.id)) continue;
-
-      await thread.members.add(member.id, "Automatischer Ticket-Teamzugriff");
-      added.push(`${member.user.tag} (${member.id})`);
-      await new Promise((resolve) => setTimeout(resolve, 250));
-    } catch (err) {
-      failed.push(`${member.user.tag} (${member.id}) → ${err?.code || "NO_CODE"}: ${err?.message || err}`);
-      console.error(`❌ Konnte ${member.user.tag} (${member.id}) nicht zum Ticket-Thread hinzufügen:`, err);
+  try {
+    const guild = await client.guilds.fetch(GUILD_ID).catch(() => null);
+    if (!guild) {
+      console.error("❌ Guild konnte für Ticket-Auto-Add nicht geladen werden.");
+      return { added: 0, failed: 0, found: 0 };
     }
+
+    await thread.join().catch((err) => {
+      console.error("⚠️ Bot konnte dem Ticket-Thread nicht beitreten:", err?.message || err);
+    });
+
+    const allowedRoles = ticketAutoAddRoles(categoryKey);
+    const removedUserIds = await getRemovedTicketUserIds(thread.id).catch(() => new Set());
+    const fetchResult = await fetchCachedGuildMembersForTickets(guild, allowedRoles);
+    const members = fetchResult.members;
+
+    const candidates = members.filter((member) => {
+      if (!member || member.user?.bot) return false;
+      if (removedUserIds.has(member.id)) return false;
+      return memberHasAnyRole(member, allowedRoles);
+    });
+
+    const added = [];
+    const failed = [];
+
+    for (const [, member] of candidates) {
+      try {
+        if (await isTicketUserRemoved(thread.id, member.id)) continue;
+        await thread.members.add(member.id).catch((err) => { throw err; });
+        added.push(`${member.user.tag} (${member.id})`);
+        await new Promise((resolve) => setTimeout(resolve, 350));
+      } catch (err) {
+        failed.push(`${member.user.tag} (${member.id}) → ${err?.code || "NO_CODE"}: ${err?.message || err}`);
+        console.error(`❌ Konnte ${member.user.tag} (${member.id}) nicht zum Ticket-Thread hinzufügen:`, err?.message || err);
+      }
+    }
+
+    const roleText = allowedRoles.map((roleId) => {
+      const role = guild.roles.cache.get(roleId);
+      return role ? `${role.name} (${roleId})` : roleId;
+    }).join("\n");
+
+    await sendTicketDebugLog(
+      `🎫 **Ticket-Debug** (${categoryKey})\n` +
+      `Thread: ${thread.name} (${thread.id})\n` +
+      `Member-Quelle: **${fetchResult.source}**\n` +
+      `Erlaubte Rollen:\n${roleText}\n\n` +
+      `Gefundene gecachte Teammitglieder: **${candidates.size}**\n` +
+      `Automatisch hinzugefügt: **${added.length}**\n` +
+      `Fehlgeschlagen: **${failed.length}**\n\n` +
+      (added.length ? `**Hinzugefügt:**\n${added.slice(0, 12).join("\n")}\n\n` : "") +
+      (failed.length ? `**Fehler:**\n${failed.slice(0, 10).join("\n")}` : "✅ Ticket-Auto-Add abgeschlossen.") +
+      `\n\nℹ️ Hinweis: Der Bot lädt absichtlich nicht mehr alle Server-Mitglieder, damit keine Rate-Limits entstehen. ` +
+      `Wer nicht automatisch hinzugefügt wurde, kann mit \`/ticket-add\` ergänzt werden.`
+    ).catch(() => null);
+
+    return { added: added.length, failed: failed.length, found: candidates.size };
+  } catch (err) {
+    console.error("❌ Fehler in addAllowedStaffToThread:", err?.message || err);
+    return { added: 0, failed: 1, found: 0 };
   }
-
-  const debugText =
-    `🎫 **Ticket-Debug** (${categoryKey})\n` +
-    `Thread: ${thread.name} (${thread.id})\n` +
-    `Member-Quelle: **${fetchResult.source}**\n` +
-    (fetchResult.error ? `Fetch-Fehler/Fallback: \`${fetchResult.error?.code || "NO_CODE"}: ${String(fetchResult.error?.message || fetchResult.error).slice(0, 600)}\`\n` : "") +
-    `Geladene Server-Mitglieder: **${members.size}**\n` +
-    `Gefundene Teammitglieder: **${candidates.size}**\n` +
-    `Erfolgreich hinzugefügt: **${added.length}**\n` +
-    `Fehlgeschlagen: **${failed.length}**\n\n` +
-    `**Rollen-Check:**\n${roleCounts.slice(0, 20).join("\n")}\n\n` +
-    (added.length ? `**Hinzugefügt:**\n${added.slice(0, 12).join("\n")}\n\n` : "") +
-    (failed.length
-      ? `**Fehler:**\n${failed.slice(0, 10).join("\n")}`
-      : `✅ Keine Fehler beim Hinzufügen.`);
-
-  await sendTicketDebugLog(debugText);
-
-  return { added: added.length, failed: failed.length, found: candidates.size };
 }
 
 async function createTicketFromButton(interaction, categoryKey) {
-  const category = TICKET_CATEGORIES[categoryKey];
-  if (!category) return interaction.reply({ content: "❌ Diese Ticket-Kategorie existiert nicht.", ephemeral: true });
+  // Sofort antworten, damit der Ticket-Button niemals ewig lädt.
+  await interaction.deferReply({ ephemeral: true }).catch(() => null);
 
-  const parentChannel = await client.channels.fetch(category.channelId).catch(() => null);
-  if (!parentChannel || !parentChannel.threads) {
-    return interaction.reply({ content: "❌ Der Ticket-Channel wurde nicht gefunden oder ist kein Textchannel.", ephemeral: true });
+  try {
+    const category = TICKET_CATEGORIES[categoryKey];
+    if (!category) {
+      return interaction.editReply({ content: "❌ Diese Ticket-Kategorie existiert nicht." }).catch(() => null);
+    }
+
+    const parentChannel = await client.channels.fetch(category.channelId).catch(() => null);
+    if (!parentChannel || !parentChannel.threads) {
+      return interaction.editReply({ content: "❌ Der Ticket-Channel wurde nicht gefunden oder ist kein Textchannel." }).catch(() => null);
+    }
+
+    const baseName = `${category.emoji}-${category.short}-anfrage`;
+    const thread = await parentChannel.threads.create({
+      name: baseName,
+      autoArchiveDuration: 1440,
+      type: ChannelType.PrivateThread,
+      invitable: false,
+      reason: `Ticket erstellt von ${interaction.user.tag}`,
+    });
+
+    await thread.members.add(interaction.user.id).catch((err) => {
+      console.error("❌ Ticket-Ersteller konnte nicht zum Thread hinzugefügt werden:", err?.message || err);
+    });
+
+    const insert = await query(
+      `
+      INSERT INTO ticket_records (thread_id, opener_id, category, base_name, current_name)
+      VALUES ($1, $2, $3, $4, $5)
+      RETURNING id;
+      `,
+      [thread.id, interaction.user.id, categoryKey, baseName, baseName]
+    );
+
+    const ticketId = insert.rows[0].id;
+
+    const embed = new EmbedBuilder()
+      .setColor(0x5dade2)
+      .setTitle(`${category.emoji} ・${category.label.toUpperCase()}`)
+      .setDescription(
+        `Willkommen <@${interaction.user.id}>.\n\n` +
+          `${category.description}\n\n` +
+          "Bitte beschreibe dein Anliegen so genau wie möglich. Ein Teammitglied wird sich darum kümmern.\n\n" +
+          "━━━━━━━━━━━━━━━━━━━━\n" +
+          `🎫 Ticket-ID: **#${ticketId}**\n` +
+          `👤 Erstellt von: <@${interaction.user.id}>\n` +
+          `📌 Status: **Offen**\n` +
+          "━━━━━━━━━━━━━━━━━━━━"
+      )
+      .setFooter({ text: "Pearls • Ticket-System" })
+      .setTimestamp();
+
+    await thread.send({
+      content: `@everyone <@${interaction.user.id}>`,
+      embeds: [embed],
+      components: [ticketThreadButtons()],
+      allowedMentions: {
+        parse: ["everyone"],
+        users: [interaction.user.id],
+      },
+    }).catch((err) => {
+      console.error("❌ Ticket-Startnachricht konnte nicht gesendet werden:", err?.message || err);
+    });
+
+    await interaction.editReply({ content: `✅ Dein Ticket wurde erstellt: ${thread}` }).catch(() => null);
+
+    // Auto-Add läuft absichtlich im Hintergrund. Dadurch blockiert es keine Buttons und keine Slash-Commands.
+    addAllowedStaffToThread(thread, categoryKey).then((staffAddResult) => {
+      console.log(`🎫 Ticket erstellt: ${categoryKey} | Gefunden: ${staffAddResult.found || 0} | Hinzugefügt: ${staffAddResult.added || 0} | Fehler: ${staffAddResult.failed || 0}`);
+    }).catch((err) => {
+      console.error("❌ Ticket-Auto-Add Hintergrundfehler:", err?.message || err);
+    });
+  } catch (err) {
+    console.error("❌ Fehler beim Erstellen des Tickets:", err);
+    return interaction.editReply({
+      content: "❌ Beim Erstellen des Tickets ist ein Fehler passiert. Schau bitte in die Railway Logs.",
+    }).catch(() => null);
   }
-
-  await interaction.deferReply({ ephemeral: true });
-
-  const baseName = `${category.emoji}-${category.short}-anfrage`;
-  const thread = await parentChannel.threads.create({
-    name: baseName,
-    autoArchiveDuration: 1440,
-    type: ChannelType.PrivateThread,
-    invitable: false,
-    reason: `Ticket erstellt von ${interaction.user.tag}`,
-  });
-
-  await thread.members.add(interaction.user.id).catch((err) => {
-    console.error("❌ Ticket-Ersteller konnte nicht zum Thread hinzugefügt werden:", err?.message || err);
-  });
-
-  const staffAddResult = await addAllowedStaffToThread(thread, categoryKey);
-
-  console.log(`🎫 Ticket erstellt: ${categoryKey} | Gefunden: ${staffAddResult.found || 0} | Hinzugefügt: ${staffAddResult.added || 0} | Fehler: ${staffAddResult.failed || 0}`);
-
-  const insert = await query(
-    `
-    INSERT INTO ticket_records (thread_id, opener_id, category, base_name, current_name)
-    VALUES ($1, $2, $3, $4, $5)
-    RETURNING id;
-    `,
-    [thread.id, interaction.user.id, categoryKey, baseName, baseName]
-  );
-
-  const ticketId = insert.rows[0].id;
-
-  const embed = new EmbedBuilder()
-    .setColor(0x5dade2)
-    .setTitle(`${category.emoji} ・${category.label.toUpperCase()}`)
-    .setDescription(
-      `Willkommen <@${interaction.user.id}>.\n\n` +
-        `${category.description}\n\n` +
-        "Bitte beschreibe dein Anliegen so genau wie möglich. Ein Teammitglied wird sich darum kümmern.\n\n" +
-        "━━━━━━━━━━━━━━━━━━━━\n" +
-        `🎫 Ticket-ID: **#${ticketId}**\n` +
-        `👤 Erstellt von: <@${interaction.user.id}>\n` +
-        `📌 Status: **Offen**\n` +
-        "━━━━━━━━━━━━━━━━━━━━"
-    )
-    .setFooter({ text: "Pearls • Ticket-System" })
-    .setTimestamp();
-
-  await thread.send({
-    content: `@everyone <@${interaction.user.id}>`,
-    embeds: [embed],
-    components: [ticketThreadButtons()],
-    allowedMentions: {
-      parse: ["everyone"],
-      users: [interaction.user.id],
-    },
-  });
-
-  await interaction.editReply({ content: `✅ Dein Ticket wurde erstellt: ${thread}` });
 }
 
 async function claimTicket(interaction) {
@@ -1602,77 +1609,83 @@ async function archiveTicketForDeletion(thread, ticket, actorId, reasonText) {
 }
 
 async function handleTicketCloseDecision(interaction, closeToken, decision) {
-  // Extrem wichtig: Button SOFORT bestätigen, sonst lädt Discord dauerhaft.
+  // Robuster Button-Fix:
+  // Wir schicken sofort eine kleine private Antwort. Dadurch verschwindet das endlose Discord-Laden zuverlässig.
+  let repliedWithPrivateMessage = false;
+
   try {
     if (!interaction.deferred && !interaction.replied) {
-      await interaction.deferUpdate();
+      await interaction.reply({
+        content: decision === "confirm" ? "⏳ Ticket wird geschlossen..." : "⏳ Schließungsanfrage wird abgebrochen...",
+        ephemeral: true,
+      });
+      repliedWithPrivateMessage = true;
     }
   } catch (err) {
-    console.error("⚠️ Close-Button konnte nicht sofort bestätigt werden:", err?.message || err);
+    console.error("⚠️ Close-Button konnte nicht per Reply bestätigt werden, versuche deferUpdate:", err?.message || err);
+
+    try {
+      if (!interaction.deferred && !interaction.replied) await interaction.deferUpdate();
+    } catch (deferErr) {
+      console.error("❌ Close-Button konnte gar nicht bestätigt werden:", deferErr?.message || deferErr);
+    }
   }
+
+  const privateDone = async (content) => {
+    try {
+      if (repliedWithPrivateMessage || interaction.deferred) {
+        return await interaction.editReply({ content });
+      }
+      if (!interaction.replied) return await interaction.reply({ content, ephemeral: true });
+      return await interaction.followUp({ content, ephemeral: true });
+    } catch (err) {
+      return interaction.followUp({ content, ephemeral: true }).catch(() => null);
+    }
+  };
 
   try {
     let thread = interaction.channel?.isThread?.()
       ? interaction.channel
       : await client.channels.fetch(closeToken).catch(() => null);
 
-    let ticket = await getTicketFromCloseToken(closeToken);
+    let ticket = null;
 
-    // Wichtig für alte Buttons: Wenn der gespeicherte Token nicht passt,
-    // wird das Ticket direkt aus dem aktuellen Thread geholt.
-    if (!ticket && thread?.isThread?.()) {
-      ticket = await getOrRecoverTicketFromThread(thread);
+    if (thread?.isThread?.()) {
+      ticket = await getTicketByThread(thread.id).catch(() => null);
+      if (!ticket) ticket = await getOrRecoverTicketFromThread(thread).catch(() => null);
     }
+
+    if (!ticket) ticket = await getTicketFromCloseToken(closeToken).catch(() => null);
 
     if (!thread && ticket?.thread_id) {
       thread = await client.channels.fetch(ticket.thread_id).catch(() => null);
     }
 
-    if (!thread) {
-      return interaction.followUp({
-        content: "❌ Der Ticket-Thread wurde nicht gefunden. Bitte prüfe, ob der Thread noch existiert.",
-        ephemeral: true,
-      }).catch(() => null);
+    if (!thread || !thread.isThread?.()) {
+      return privateDone("❌ Der Ticket-Thread wurde nicht gefunden. Bitte prüfe, ob der Thread noch existiert.");
     }
 
     if (!ticket) {
-      return interaction.followUp({
-        content: "❌ Das Ticket wurde in der Datenbank nicht gefunden. Bitte schließe/öffne das Ticket über ein neues Ticketpanel erneut.",
-        ephemeral: true,
-      }).catch(() => null);
+      return privateDone("❌ Das Ticket wurde in der Datenbank nicht gefunden. Bitte erstelle ein neues Ticket über das Ticketpanel.");
     }
 
     const memberCanManage = interaction.member && canUseTicketStaffCommands(interaction.member, ticket.category);
     const isTicketOpener = interaction.user.id === ticket.opener_id;
 
     if (!isTicketOpener && !memberCanManage) {
-      return interaction.followUp({
-        content: "❌ Nur der Ticket-Ersteller oder berechtigte Teammitglieder dürfen diese Schließung bestätigen oder abbrechen.",
-        ephemeral: true,
-      }).catch(() => null);
+      return privateDone("❌ Nur der Ticket-Ersteller oder berechtigte Teammitglieder dürfen diese Schließung bestätigen oder abbrechen.");
     }
 
-    // Button deaktivieren. Wenn das nicht klappt, soll trotzdem alles weiterlaufen.
-    await interaction.message.edit({ components: disableActionRows(interaction.message.components) }).catch((err) => {
-      console.error("⚠️ Ticket-Close-Buttons konnten nicht deaktiviert werden:", err?.message || err);
-    });
-
     if (decision === "confirm") {
-      await interaction.followUp({ content: "🔒 Ticket wird geschlossen...", ephemeral: true }).catch(() => null);
+      await interaction.message.edit({ components: disableActionRows(interaction.message.components) }).catch(() => null);
       await archiveTicketForDeletion(thread, ticket, interaction.user.id, "Das Ticket wurde bestätigt geschlossen.");
-      return;
+      return privateDone("✅ Ticket wurde geschlossen und archiviert.");
     }
 
     // ===== ABBRECHEN =====
     const restoreName = getRestoreTicketName(ticket);
 
-    await thread.setArchived(false, "Schließung abgebrochen").catch(() => null);
-    await thread.setLocked(false, "Schließung abgebrochen").catch(() => null);
-
-    await thread.setName(restoreName, `Schließung abgebrochen von ${interaction.user.tag}`).catch((err) => {
-      console.error("❌ Ticket konnte nach Abbruch nicht zurückbenannt werden:", err?.message || err);
-    });
-
+    // Erst DB zurücksetzen, damit ein erneutes Schließen sofort wieder möglich ist.
     await query(
       `
       UPDATE ticket_records
@@ -1689,6 +1702,17 @@ async function handleTicketCloseDecision(interaction, closeToken, decision) {
       [ticket.thread_id || thread.id, restoreName]
     ).catch((err) => console.error("❌ Ticket-Cancel DB-Update fehlgeschlagen:", err));
 
+    await thread.setArchived(false, "Schließung abgebrochen").catch(() => null);
+    await thread.setLocked(false, "Schließung abgebrochen").catch(() => null);
+
+    await thread.setName(restoreName, `Schließung abgebrochen von ${interaction.user.tag}`).catch((err) => {
+      console.error("❌ Ticket konnte nach Abbruch nicht zurückbenannt werden:", err?.message || err);
+    });
+
+    await interaction.message.edit({ components: disableActionRows(interaction.message.components) }).catch((err) => {
+      console.error("⚠️ Ticket-Close-Buttons konnten nicht deaktiviert werden:", err?.message || err);
+    });
+
     await thread.send({
       content:
         `@everyone\n\n` +
@@ -1702,22 +1726,13 @@ async function handleTicketCloseDecision(interaction, closeToken, decision) {
       },
     }).catch(async (err) => {
       console.error("❌ Abbruch-Nachricht konnte nicht gesendet werden:", err?.message || err);
-      await interaction.followUp({
-        content: "⚠️ Status wurde zurückgesetzt, aber die Nachricht konnte nicht in den Thread gesendet werden. Prüfe die Bot-Rechte.",
-        ephemeral: true,
-      }).catch(() => null);
+      await privateDone("⚠️ Status wurde zurückgesetzt, aber die Nachricht konnte nicht in den Thread gesendet werden. Prüfe die Bot-Rechte.");
     });
 
-    return interaction.followUp({
-      content: "✅ Schließungsanfrage wurde abgebrochen. Das Ticket ist wieder offen.",
-      ephemeral: true,
-    }).catch(() => null);
+    return privateDone("✅ Schließungsanfrage wurde abgebrochen. Das Ticket ist wieder offen.");
   } catch (err) {
     console.error("❌ Fehler bei Ticket-Schließungsentscheidung:", err);
-    return interaction.followUp({
-      content: "❌ Beim Verarbeiten der Schließungsentscheidung ist ein Fehler passiert. Schau bitte in die Railway Logs.",
-      ephemeral: true,
-    }).catch(() => null);
+    return privateDone("❌ Beim Verarbeiten der Schließungsentscheidung ist ein Fehler passiert. Schau bitte in die Railway Logs.");
   }
 }
 
