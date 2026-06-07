@@ -1283,34 +1283,49 @@ async function unmarkTicketUserRemoved(threadId, userId) {
 }
 
 async function forceRemoveTicketMember(thread, userId, reason = "Ticket-Mitglied entfernt") {
-  const attempts = [0, 3000, 12000];
   const results = [];
 
-  for (const delay of attempts) {
-    setTimeout(async () => {
-      const stillRemoved = await isTicketUserRemoved(thread.id, userId);
-      if (!stillRemoved) return;
-
-      try {
-        await thread.members.remove(userId, reason);
-        results.push(`✅ Remove nach ${delay}ms erfolgreich`);
-      } catch (err) {
-        results.push(`❌ Remove nach ${delay}ms fehlgeschlagen: ${err?.code || "NO_CODE"}: ${err?.message || err}`);
-      }
-
-      if (delay === attempts[attempts.length - 1]) {
-        await sendTicketDebugLog(
-          `🧹 **Ticket-Remove Debug**
-` +
-          `Thread: ${thread.name} (${thread.id})
-` +
-          `User: <@${userId}> (${userId})
-` +
-          results.join("\n")
-        );
-      }
-    }, delay);
+  // 1) Direkt entfernen. Dadurch muss der Command nicht zwei Mal ausgeführt werden.
+  try {
+    await thread.members.remove(userId);
+    results.push("✅ Direktes Entfernen ausgeführt");
+  } catch (err) {
+    results.push(`❌ Direktes Entfernen fehlgeschlagen: ${err?.code || "NO_CODE"}: ${err?.message || err}`);
   }
+
+  // 2) Kurz danach nur prüfen. Ein zweiter Remove passiert nur, wenn Discord den User wirklich noch im Thread sieht.
+  setTimeout(async () => {
+    const stillBlocked = await isTicketUserRemoved(thread.id, userId).catch(() => false);
+    if (!stillBlocked) return;
+
+    let stillInThread = null;
+    try {
+      stillInThread = await thread.members.fetch(userId);
+    } catch (err) {
+      // Wenn Discord den Thread-Member nicht mehr findet, ist der User bereits draußen.
+      stillInThread = null;
+      results.push("✅ Prüfung: User ist nicht mehr im Thread");
+    }
+
+    if (stillInThread) {
+      try {
+        await thread.members.remove(userId);
+        results.push("🔁 Retry ausgeführt, weil User noch im Thread war");
+      } catch (err) {
+        results.push(`❌ Retry fehlgeschlagen: ${err?.code || "NO_CODE"}: ${err?.message || err}`);
+      }
+    }
+
+    const nl = String.fromCharCode(10);
+    await sendTicketDebugLog(
+      [
+        `🧹 **Ticket-Remove Debug**`,
+        `Thread: ${thread.name} (${thread.id})`,
+        `User: <@${userId}> (${userId})`,
+        results.join(nl),
+      ].join(nl)
+    ).catch(() => null);
+  }, 2000);
 }
 
 async function ensureTicketThread(interaction) {
