@@ -1138,9 +1138,16 @@ function disableActionRows(rows = []) {
   }
 }
 
+function stripTicketStatusPrefixes(name) {
+  return String(name || "ticket")
+    .replace(/^(closing|closed)-+/i, "")
+    .replace(/^(closing|closed)-+/i, "")
+    .slice(0, 95);
+}
+
 function getRestoreTicketName(ticket) {
   const raw = ticket?.current_name || ticket?.base_name || "ticket";
-  return String(raw).replace(/^closing-+/i, "").slice(0, 95);
+  return stripTicketStatusPrefixes(raw);
 }
 
 function getClosingTicketName(ticket) {
@@ -1693,6 +1700,36 @@ async function fetchFreshTicketThread(threadId, categoryKey = null) {
   return thread?.isThread?.() ? thread : null;
 }
 
+async function forceRenameOpenTicketThread(threadId, categoryKey, safeName, actorId, attempt = 1) {
+  const reason = `Ticketname nach Öffnung zurückgesetzt von ${actorId}`;
+  const thread = await fetchFreshTicketThread(threadId, categoryKey);
+
+  if (!thread?.isThread?.()) {
+    console.error(`⚠️ Ticket-Open Rename Versuch ${attempt}: Thread nicht gefunden`, threadId);
+    return false;
+  }
+
+  try {
+    // Ganz wichtig: erst wirklich offen/entsperrt halten, dann Name setzen.
+    await ticketTimeout(
+      thread.edit({ archived: false, locked: false, name: safeName }, reason),
+      9000,
+      `Ticket-Open Titel ändern Versuch ${attempt}`
+    );
+
+    await query(
+      `UPDATE ticket_records SET current_name = $2, updated_at = NOW() WHERE thread_id = $1`,
+      [threadId, safeName]
+    ).catch((err) => console.error("⚠️ Ticket-Open Rename DB-Update fehlgeschlagen:", err?.message || err));
+
+    console.log(`✅ Ticket-Open Titel geändert: ${threadId} -> ${safeName}`);
+    return true;
+  } catch (err) {
+    console.error(`⚠️ Ticket-Open Titel ändern Versuch ${attempt} fehlgeschlagen:`, err?.message || err);
+    return false;
+  }
+}
+
 async function forceOpenTicketThread(threadId, categoryKey, restoreName, actorId) {
   let thread = await fetchFreshTicketThread(threadId, categoryKey);
 
@@ -1702,14 +1739,12 @@ async function forceOpenTicketThread(threadId, categoryKey, restoreName, actorId
   }
 
   const reason = `Ticket wieder geöffnet von ${actorId}`;
-  const safeName = String(restoreName || thread.name || "ticket").replace(/^closed-+/i, "").slice(0, 95);
+  const safeName = stripTicketStatusPrefixes(restoreName || thread.name || "ticket");
 
-  // SCHNELLER OPEN-FIX:
-  // Wichtigster Schritt zuerst: Thread sofort entsperren + entarchivieren.
-  // Der Name und Auto-Add laufen danach im Hintergrund, damit /ticket-open nicht langsam wirkt.
+  // Erst den Thread schnell öffnen. Das blockiert den User kaum.
   await ticketTimeout(
     thread.edit({ locked: false, archived: false }, reason),
-    6000,
+    7000,
     "Thread schnell öffnen"
   ).catch((err) => {
     console.error("⚠️ Ticket-Open: Schnelles Öffnen fehlgeschlagen:", err?.message || err);
@@ -1718,19 +1753,13 @@ async function forceOpenTicketThread(threadId, categoryKey, restoreName, actorId
   // Kurz neu laden, damit Discord den Status aktualisiert.
   thread = (await fetchFreshTicketThread(threadId, categoryKey)) || thread;
 
-  // Name zurücksetzen, aber nicht den eigentlichen Open-Prozess blockieren.
-  setTimeout(() => {
-    ticketTimeout(
-      thread.edit({ name: safeName, locked: false, archived: false }, reason),
-      6000,
-      "Ticket-Open Name zurücksetzen"
-    ).catch((err) => {
-      console.error("⚠️ Ticket-Open: Name konnte nicht schnell zurückgesetzt werden:", err?.message || err);
-    });
-  }, 250);
+  // Titel zuverlässig im Hintergrund ändern. Discord übernimmt Rename manchmal erst NACH dem Entarchivieren.
+  setTimeout(() => forceRenameOpenTicketThread(threadId, categoryKey, safeName, actorId, 1), 500);
+  setTimeout(() => forceRenameOpenTicketThread(threadId, categoryKey, safeName, actorId, 2), 2500);
+  setTimeout(() => forceRenameOpenTicketThread(threadId, categoryKey, safeName, actorId, 3), 6000);
 
   console.log(
-    `🔎 Ticket-Open Schnellstatus: thread=${threadId} archived=${thread.archived} locked=${thread.locked} name=${thread.name}`
+    `🔎 Ticket-Open Schnellstatus: thread=${threadId} archived=${thread.archived} locked=${thread.locked} name=${thread.name} targetName=${safeName}`
   );
 
   return thread;
