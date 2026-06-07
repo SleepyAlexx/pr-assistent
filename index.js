@@ -35,6 +35,15 @@ const CLIENT_ID = process.env.CLIENT_ID;
 const GUILD_ID = process.env.GUILD_ID;
 const DATABASE_URL = process.env.DATABASE_URL;
 
+console.log("🚀 Start-Debug: index.js wurde geladen.");
+console.log("🔎 Env-Check:", {
+  hasToken: Boolean(TOKEN),
+  hasClientId: Boolean(CLIENT_ID),
+  guildId: GUILD_ID || null,
+  hasDatabaseUrl: Boolean(DATABASE_URL),
+  nodeEnv: process.env.NODE_ENV || null,
+});
+
 // Discord Bot Index Complete
 // =====================
 // ROLLEN
@@ -5799,4 +5808,12 @@ process.on("uncaughtException", (err) => {
   console.error("❌ Uncaught Exception:", err);
 });
 
-client.login(TOKEN);
+console.log("🔑 Discord Login wird gestartet...");
+
+client.login(TOKEN)
+  .then(() => {
+    console.log("✅ Discord Login erfolgreich angefragt. Warte auf Ready-Event...");
+  })
+  .catch((err) => {
+    console.error("❌ Discord Login fehlgeschlagen:", err);
+  });
