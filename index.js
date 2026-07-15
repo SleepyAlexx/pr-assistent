@@ -77,7 +77,7 @@ const PERSONAL_OVERVIEW_CHANNEL_ID = "1512314181259366547";
 const TIME_LOG_CHANNEL_ID = "1512314180752117936";
 
 const SHOPPING_CHANNEL_ID = "1512314177396543582";
-const APPLICATION_CHANNEL_ID = "1513128952275669135";
+const APPLICATION_CHANNEL_ID = "1526789398035697745";
 const HOUSE_BAN_CHANNEL_ID = "1512314177396543583";
 
 const MANAGEMENT_PANEL_CHANNEL_ID = "1512314180752117930";
@@ -93,6 +93,7 @@ const STATISTICS_WEEKLY_CHANNEL_ID = "1512314182299816050";
 const MANAGER_CHAT_CHANNEL_ID = "1512314181259366547";
 const STOCK_CHECK_REMINDER_CHANNEL_ID = "1512314181259366549";
 const BUSINESS_TIME_LOG_CHANNEL_ID = "1512314180752117934";
+const MONEY_LOG_CHANNEL_ID = "1512314180752117935";
 
 
 const BOOKING_REQUEST_CHANNEL_ID = "1512409329771221075";
@@ -102,13 +103,28 @@ const BOOKING_CONFIRMED_CHANNEL_ID = "1512409661029224488";
 const TERMINATION_REMOVE_ROLE_IDS = [
   EMPLOYEE_ROLE_ID,
   TEAMUPDATE_EMPLOYEE_ROLE_ID,
+  TEAMUPDATE_EMPLOYEE_BASE_ROLE_ID,
   PROBE_ROLE_ID,
+  TEAMUPDATE_PROBE_EMPLOYEE_ROLE_ID,
+  TEAMUPDATE_MANAGEMENT_BASE_ROLE_ID,
+  TEAMUPDATE_MANAGER_ROLE_ID,
+  TEAMUPDATE_PROBE_MANAGER_ROLE_ID,
+  TEAMUPDATE_PERSONAL_MANAGER_ROLE_ID,
+  TEAMUPDATE_CASINO_BASE_ROLE_ID,
+  TEAMUPDATE_CASINO_EMPLOYEE_ROLE_ID,
 ];
 
 const REGISTRATION_ROLE_IDS = [
   "1512314173844095170",
   "1512314173844095169",
   "1512314173844095175",
+];
+
+const TRACKED_EMPLOYEE_ROLE_IDS = [EMPLOYEE_ROLE_ID, PROBE_ROLE_ID];
+const MANAGEMENT_TEAMUPDATE_ROLE_IDS = [
+  TEAMUPDATE_PROBE_MANAGER_ROLE_ID,
+  TEAMUPDATE_MANAGER_ROLE_ID,
+  TEAMUPDATE_PERSONAL_MANAGER_ROLE_ID,
 ];
 
 
@@ -128,6 +144,7 @@ const client = new Client({
 
 const managementDrafts = new Map();
 const timeManagementDrafts = new Map();
+const serviceCorrectionDrafts = new Map();
 
 
 function draftKey(userId, type) {
@@ -545,6 +562,28 @@ async function registerCommands() {
     new SlashCommandBuilder()
       .setName("zeitpanel")
       .setDescription("Sendet das Zeitverwaltungs-Panel."),
+
+    new SlashCommandBuilder()
+      .setName("dienst-korrektur")
+      .setDescription("Korrigiert einen laufenden Dienst nach Crash oder Fehler.")
+      .addUserOption((option) =>
+        option
+          .setName("user")
+          .setDescription("Mitarbeiter auswählen")
+          .setRequired(true)
+      )
+      .addStringOption((option) =>
+        option
+          .setName("endzeit")
+          .setDescription("Endzeit im Format HH:MM, z. B. 19:30")
+          .setRequired(true)
+      )
+      .addStringOption((option) =>
+        option
+          .setName("grund")
+          .setDescription("Grund, z. B. Crash")
+          .setRequired(true)
+      ),
   ].map((cmd) => cmd.toJSON());
 
   async function withTimeout(promise, ms, label) {
@@ -644,14 +683,15 @@ function timeOnlyButton(creatorId) {
 
 function managementPanelRows() {
   const row1 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("mgmt_warning_start").setLabel("Verwarnung").setEmoji("⚠️").setStyle(ButtonStyle.Danger),
-    new ButtonBuilder().setCustomId("mgmt_teamupdate_start").setLabel("Teamupdate").setEmoji("🔄").setStyle(ButtonStyle.Success)
+    new ButtonBuilder().setCustomId("mgmt_training_start").setLabel("Einweisung").setEmoji("🧠").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId("mgmt_teamupdate_start").setLabel("Teamupdate").setEmoji("🔄").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId("mgmt_termination_start").setLabel("Kündigung").setEmoji("📤").setStyle(ButtonStyle.Secondary)
   );
 
   const row2 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("mgmt_termination_start").setLabel("Kündigung").setEmoji("📤").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("mgmt_warning_remove_start").setLabel("Verwarnung zurückziehen").setEmoji("🔄").setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId("mgmt_training_start").setLabel("Einweisung").setEmoji("🧠").setStyle(ButtonStyle.Success)
+    new ButtonBuilder().setCustomId("mgmt_warning_start").setLabel("Verwarnung").setEmoji("⚠️").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId("mgmt_warning_remove_start").setLabel("Verwarnung zurückziehen").setEmoji("✅").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("mgmt_time_start").setLabel("Zeitverwaltung").setEmoji("⏱️").setStyle(ButtonStyle.Secondary)
   );
 
   return [row1, row2];
@@ -670,6 +710,29 @@ function timeManagementPanelRows() {
   );
 
   return [row1, row2];
+}
+
+function buildTimeManagementPanelEmbed() {
+  return new EmbedBuilder()
+    .setColor(0x5dade2)
+    .setTitle("⏱️ ・ZEITVERWALTUNG")
+    .setDescription(
+      "━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+        "Verwalte hier die Arbeitszeiten von Mitarbeitern.\n\n" +
+        "➕ **Zeit hinzufügen**\n" +
+        "└ Erhöht Weekly und Gesamtzeit\n\n" +
+        "➖ **Zeit entfernen**\n" +
+        "└ Zieht Zeit von Weekly und Gesamtzeit ab\n\n" +
+        "📊 **Zeiten ansehen**\n" +
+        "└ Zeigt aktuelle Zeiten und letzte Änderungen\n\n" +
+        "🔄 **Weekly setzen**\n" +
+        "└ Setzt nur die aktuelle Weekly-Zeit\n\n" +
+        "🏆 **Gesamtzeit setzen**\n" +
+        "└ Setzt nur die Gesamtzeit\n" +
+        "━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+    .setFooter({ text: "Pearls • Zeitverwaltung" })
+    .setTimestamp();
 }
 
 function warningRoleSelect(customId) {
@@ -858,41 +921,68 @@ async function safeRemoveRoles(targetMember, roleIds) {
   return { removed, failed };
 }
 
+async function ensureRequiredCompanionRoles(member) {
+  if (!member?.roles?.cache) return;
+
+  const rolesToAdd = [];
+  const hasEmployeeOrProbe = TRACKED_EMPLOYEE_ROLE_IDS.some((roleId) => member.roles.cache.has(roleId));
+  const hasManagementTeamupdateRole = MANAGEMENT_TEAMUPDATE_ROLE_IDS.some((roleId) => member.roles.cache.has(roleId));
+
+  if (hasEmployeeOrProbe && !member.roles.cache.has(TEAMUPDATE_EMPLOYEE_BASE_ROLE_ID)) {
+    rolesToAdd.push(TEAMUPDATE_EMPLOYEE_BASE_ROLE_ID);
+  }
+
+  if (hasManagementTeamupdateRole) {
+    if (!member.roles.cache.has(EMPLOYEE_ROLE_ID)) rolesToAdd.push(EMPLOYEE_ROLE_ID);
+    if (!member.roles.cache.has(TEAMUPDATE_EMPLOYEE_BASE_ROLE_ID)) rolesToAdd.push(TEAMUPDATE_EMPLOYEE_BASE_ROLE_ID);
+    if (!member.roles.cache.has(TEAMUPDATE_MANAGEMENT_BASE_ROLE_ID)) rolesToAdd.push(TEAMUPDATE_MANAGEMENT_BASE_ROLE_ID);
+  }
+
+  if (rolesToAdd.length) {
+    await safeAddRoles(member, [...new Set(rolesToAdd)]);
+  }
+}
+
 async function applyTeamUpdateRoles(targetMember, updateType) {
+  let selectedRoleId = null;
   let roleIds = [];
   let removeRoleIds = [];
 
   if (updateType === "probe_employee") {
-    roleIds = [TEAMUPDATE_PROBE_EMPLOYEE_ROLE_ID, TEAMUPDATE_EMPLOYEE_BASE_ROLE_ID];
-    removeRoleIds = [];
+    selectedRoleId = TEAMUPDATE_PROBE_EMPLOYEE_ROLE_ID;
+    roleIds = [selectedRoleId, TEAMUPDATE_EMPLOYEE_BASE_ROLE_ID];
   }
 
   if (updateType === "employee") {
-    roleIds = [TEAMUPDATE_EMPLOYEE_ROLE_ID, TEAMUPDATE_EMPLOYEE_BASE_ROLE_ID];
+    selectedRoleId = TEAMUPDATE_EMPLOYEE_ROLE_ID;
+    roleIds = [selectedRoleId, TEAMUPDATE_EMPLOYEE_BASE_ROLE_ID];
     removeRoleIds = [TEAMUPDATE_PROBE_EMPLOYEE_ROLE_ID, PROBE_ROLE_ID];
   }
 
   if (updateType === "casino_employee") {
-    roleIds = [TEAMUPDATE_CASINO_EMPLOYEE_ROLE_ID, TEAMUPDATE_CASINO_BASE_ROLE_ID];
-    removeRoleIds = [];
+    selectedRoleId = TEAMUPDATE_CASINO_EMPLOYEE_ROLE_ID;
+    roleIds = [selectedRoleId, TEAMUPDATE_CASINO_BASE_ROLE_ID];
   }
 
   if (updateType === "probe_manager") {
-    roleIds = [TEAMUPDATE_MANAGEMENT_BASE_ROLE_ID, TEAMUPDATE_PROBE_MANAGER_ROLE_ID];
-    removeRoleIds = [];
+    selectedRoleId = TEAMUPDATE_PROBE_MANAGER_ROLE_ID;
+    roleIds = [selectedRoleId, TEAMUPDATE_MANAGEMENT_BASE_ROLE_ID, EMPLOYEE_ROLE_ID, TEAMUPDATE_EMPLOYEE_BASE_ROLE_ID];
+    removeRoleIds = [TEAMUPDATE_PROBE_EMPLOYEE_ROLE_ID, PROBE_ROLE_ID];
   }
 
   if (updateType === "manager") {
-    roleIds = [TEAMUPDATE_MANAGER_ROLE_ID, TEAMUPDATE_MANAGEMENT_BASE_ROLE_ID];
-    removeRoleIds = [TEAMUPDATE_PROBE_MANAGER_ROLE_ID];
+    selectedRoleId = TEAMUPDATE_MANAGER_ROLE_ID;
+    roleIds = [selectedRoleId, TEAMUPDATE_MANAGEMENT_BASE_ROLE_ID, EMPLOYEE_ROLE_ID, TEAMUPDATE_EMPLOYEE_BASE_ROLE_ID];
+    removeRoleIds = [TEAMUPDATE_PROBE_MANAGER_ROLE_ID, TEAMUPDATE_PROBE_EMPLOYEE_ROLE_ID, PROBE_ROLE_ID];
   }
 
   if (updateType === "personal_manager") {
-    roleIds = [TEAMUPDATE_PERSONAL_MANAGER_ROLE_ID, TEAMUPDATE_MANAGEMENT_BASE_ROLE_ID];
-    removeRoleIds = [];
+    selectedRoleId = TEAMUPDATE_PERSONAL_MANAGER_ROLE_ID;
+    roleIds = [selectedRoleId, TEAMUPDATE_MANAGEMENT_BASE_ROLE_ID, EMPLOYEE_ROLE_ID, TEAMUPDATE_EMPLOYEE_BASE_ROLE_ID];
+    removeRoleIds = [TEAMUPDATE_PROBE_EMPLOYEE_ROLE_ID, PROBE_ROLE_ID];
   }
 
-  if (!roleIds.length) {
+  if (!selectedRoleId || !roleIds.length) {
     throw new Error(`Unbekannter Teamupdate-Typ: ${updateType}`);
   }
 
@@ -901,8 +991,12 @@ async function applyTeamUpdateRoles(targetMember, updateType) {
     ? await safeRemoveRoles(targetMember, removeRoleIds)
     : { removed: [], failed: [] };
 
+  await ensureEmployee(targetMember.id).catch(() => null);
+  await query(`UPDATE employees SET left_server = FALSE WHERE user_id = $1`, [targetMember.id]).catch(() => null);
+
   return {
-    roleText: roleIds.map((id) => `<@&${id}>`).join(" + ") || "Unbekannt",
+    roleText: `<@&${selectedRoleId}>`,
+    selectedRoleId,
     failedAdd: addResult.failed,
     failedRemove: removeResult.failed,
   };
@@ -1041,13 +1135,33 @@ async function getOnlineUsersMap() {
   return map;
 }
 
+async function getTrackedEmployeeIds() {
+  const guild = await client.guilds.fetch(GUILD_ID).catch(() => null);
+  if (!guild) return [];
+
+  const members = await guild.members.fetch().catch(() => null);
+  if (!members) return [];
+
+  return [...members.values()]
+    .filter((member) => TRACKED_EMPLOYEE_ROLE_IDS.some((roleId) => member.roles.cache.has(roleId)))
+    .map((member) => member.id);
+}
+
+function asQueryRows(rows = []) {
+  return { rows };
+}
+
 async function updateTotalWorktimeMessage() {
-  const result = await query(`
-    SELECT user_id, total_minutes AS minutes
-    FROM employees
-    WHERE left_server = FALSE
-    ORDER BY total_minutes DESC;
-  `);
+  const trackedIds = await getTrackedEmployeeIds();
+  const result = trackedIds.length
+    ? await query(`
+        SELECT user_id, total_minutes AS minutes
+        FROM employees
+        WHERE left_server = FALSE
+          AND user_id = ANY($1::text[])
+        ORDER BY total_minutes DESC;
+      `, [trackedIds])
+    : asQueryRows([]);
 
   const onlineMap = await getOnlineUsersMap();
 
@@ -1076,7 +1190,7 @@ async function updateTotalWorktimeMessage() {
     .setColor(0x3498db)
     .setTitle("💠 ・TIMEDESK • GESAMTZEITEN")
     .setDescription(description)
-    .setFooter({ text: `Live aktualisiert alle 2 Minuten | Seite ${page + 1}/${totalPages}` })
+    .setFooter({ text: `Nur Probe-Mitarbeiter & Mitarbeiter | Seite ${page + 1}/${totalPages}` })
     .setTimestamp();
 
   await sendOrUpdatePermanentMessage(TOTAL_WORKTIME_CHANNEL_ID, "total_worktime_message_id", {
@@ -1086,12 +1200,16 @@ async function updateTotalWorktimeMessage() {
 }
 
 async function updateWeeklyWorktimeMessage() {
-  const result = await query(`
-    SELECT user_id, weekly_minutes AS minutes
-    FROM employees
-    WHERE left_server = FALSE
-    ORDER BY weekly_minutes DESC;
-  `);
+  const trackedIds = await getTrackedEmployeeIds();
+  const result = trackedIds.length
+    ? await query(`
+        SELECT user_id, weekly_minutes AS minutes
+        FROM employees
+        WHERE left_server = FALSE
+          AND user_id = ANY($1::text[])
+        ORDER BY weekly_minutes DESC;
+      `, [trackedIds])
+    : asQueryRows([]);
 
   const onlineMap = await getOnlineUsersMap();
 
@@ -1120,7 +1238,7 @@ async function updateWeeklyWorktimeMessage() {
     .setColor(0x2ecc71)
     .setTitle("💎 ・TIMEDESK • WEEKLY LEADERBOARD")
     .setDescription(description)
-    .setFooter({ text: `Live aktualisiert alle 2 Minuten | Seite ${page + 1}/${totalPages}` })
+    .setFooter({ text: `Nur Probe-Mitarbeiter & Mitarbeiter | Seite ${page + 1}/${totalPages}` })
     .setTimestamp();
 
   await sendOrUpdatePermanentMessage(WEEKLY_WORKTIME_CHANNEL_ID, "weekly_worktime_message_id", {
@@ -1406,13 +1524,27 @@ async function syncEmployeeRoles() {
   const members = await guild.members.fetch();
   const employees = await query(`SELECT user_id FROM employees`);
 
+  for (const member of members.values()) {
+    const hasEmployeeOrProbe = TRACKED_EMPLOYEE_ROLE_IDS.some((roleId) => member.roles.cache.has(roleId));
+    const hasManagementTeamupdateRole = MANAGEMENT_TEAMUPDATE_ROLE_IDS.some((roleId) => member.roles.cache.has(roleId));
+
+    if (hasEmployeeOrProbe || hasManagementTeamupdateRole) {
+      await ensureRequiredCompanionRoles(member).catch(() => null);
+      await ensureEmployee(member.id);
+      await query(`UPDATE employees SET left_server = FALSE WHERE user_id = $1`, [member.id]);
+      await autoLinkBusinessNameFromMember(member, "Rollen-Sync");
+    }
+  }
+
   for (const employee of employees.rows) {
     const member = members.get(employee.user_id);
-    const hasEmployeeRole = member?.roles.cache.has(EMPLOYEE_ROLE_ID) || false;
+    const isTracked = member
+      ? TRACKED_EMPLOYEE_ROLE_IDS.some((roleId) => member.roles.cache.has(roleId))
+      : false;
 
-    await query(`UPDATE employees SET left_server = $2 WHERE user_id = $1`, [employee.user_id, !hasEmployeeRole]);
+    await query(`UPDATE employees SET left_server = $2 WHERE user_id = $1`, [employee.user_id, !isTracked]);
 
-    if (!hasEmployeeRole) {
+    if (!isTracked) {
       await query(`DELETE FROM active_sessions WHERE user_id = $1`, [employee.user_id]);
       if (member) await member.roles.remove(DUTY_ROLE_ID).catch(() => {});
     }
@@ -1420,7 +1552,7 @@ async function syncEmployeeRoles() {
 
   await updateTotalWorktimeMessage();
   await updateWeeklyWorktimeMessage();
-  console.log("✅ Mitarbeiter-Rollen wurden synchronisiert.");
+  console.log("✅ Mitarbeiter-/Probe-Mitarbeiter-Rollen wurden synchronisiert.");
 }
 
 async function getCleanUserDisplay(userId) {
@@ -1443,7 +1575,10 @@ async function getCleanUserDisplay(userId) {
 }
 
 async function updateDashboardMessage() {
-  const activeSessions = await query(`SELECT user_id FROM active_sessions`);
+  const trackedIds = await getTrackedEmployeeIds();
+  const activeSessions = trackedIds.length
+    ? await query(`SELECT user_id FROM active_sessions WHERE user_id = ANY($1::text[])`, [trackedIds])
+    : asQueryRows([]);
   const activeWarnings = await query(`SELECT COUNT(*)::int AS count FROM warning_records WHERE active = TRUE`);
   const oldWarnings = await query(`
     SELECT COUNT(*)::int AS count
@@ -1452,13 +1587,14 @@ async function updateDashboardMessage() {
       AND issued_at <= NOW() - INTERVAL '14 days'
   `);
   const activeStands = await query(`SELECT COUNT(*)::int AS count FROM active_stands WHERE status = 'active'`).catch(() => ({ rows: [{ count: 0 }] }));
-  const employees = await query(`SELECT COUNT(*)::int AS count, COALESCE(AVG(weekly_minutes), 0)::int AS avg_weekly FROM employees WHERE left_server = FALSE`);
-  const activeAbsences = await query(`
-    SELECT COUNT(*)::int AS count
-    FROM absences
-    WHERE date_from <= CURRENT_DATE
-      AND date_to >= CURRENT_DATE
-  `);
+  const employees = trackedIds.length
+    ? await query(`
+        SELECT COUNT(*)::int AS count, COALESCE(AVG(weekly_minutes), 0)::int AS avg_weekly
+        FROM employees
+        WHERE left_server = FALSE
+          AND user_id = ANY($1::text[])
+      `, [trackedIds])
+    : asQueryRows([{ count: 0, avg_weekly: 0 }]);
   const weekAbsences = await query(`
     SELECT COUNT(*)::int AS count
     FROM absences
@@ -1466,67 +1602,52 @@ async function updateDashboardMessage() {
       AND date_to >= CURRENT_DATE
   `);
 
-  const lastStockCheck = await query(`
-    SELECT *
-    FROM stock_check_logs
-    ORDER BY created_at DESC
-    LIMIT 1
-  `).catch(() => ({ rows: [] }));
-
   const activeList = activeSessions.rows.length
-    ? (await Promise.all(activeSessions.rows.map((r) => getCleanUserDisplay(r.user_id)))).join("\\n").slice(0, 900)
-    : "Aktuell ist niemand eingestempelt.";
+    ? (await Promise.all(activeSessions.rows.map((r) => getCleanUserDisplay(r.user_id)))).join("\n").slice(0, 900)
+    : "└ Niemand ist aktuell eingestempelt.";
 
-  const stockStatus = lastStockCheck.rows[0]
-    ? `Letzte Prüfung: <t:${Math.floor(new Date(lastStockCheck.rows[0].created_at).getTime() / 1000)}:R> von <@${lastStockCheck.rows[0].user_id}>`
-    : "Noch keine Lagerprüfung gespeichert.";
+  const taskText = Number(oldWarnings.rows[0]?.count || 0) > 0 || Number(weekAbsences.rows[0]?.count || 0) > 0
+    ? "└ 🟡 Es gibt offene Punkte zum Prüfen."
+    : "└ 🟢 Zurzeit sind keine offenen Prüfaufgaben vorhanden.";
 
   const embed = new EmbedBuilder()
     .setColor(0x5dade2)
     .setTitle("💠 ・PEARLS DASHBOARD")
     .setDescription(
       "━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-        "**Live-Übersicht für Management & Personal**\n" +
-        "Alle wichtigen Aufgaben und Zeiten auf einen Blick.\n" +
+        "**Live-Übersicht für Management & Personal Management**\n" +
+        "🟢 Alles gut • 🟡 Prüfen • 🔴 Handeln\n" +
         "━━━━━━━━━━━━━━━━━━━━━━━━"
     )
     .addFields(
       {
-        name: "👥 **Team & Zeiten**",
+        name: "👥 TEAM & ZEITEN",
         value:
-          `🟢 **Im Dienst**
-└ ${activeSessions.rows.length}
-
-` +
-          `👥 **Mitarbeiter in Liste**
-└ ${employees.rows[0]?.count || 0}
-
-` +
-          `📊 **Ø Weekly-Zeit**
-└ ${formatShortMinutes(employees.rows[0]?.avg_weekly || 0)}`,
+          `👥 **Mitarbeiter im Team**\n└ ${employees.rows[0]?.count || 0}\n\n` +
+          `🟢 **Aktuell im Dienst**\n└ ${activeSessions.rows.length}\n\n` +
+          `📊 **Ø Wochenzeit pro Mitarbeiter**\n└ ${formatShortMinutes(employees.rows[0]?.avg_weekly || 0)}`,
       },
       {
-        name: "👩‍💼 **Personal Management — Offene Aufgaben**",
+        name: "👩‍💼 PERSONAL MANAGEMENT",
         value:
-          `• Alte Verwarnungen prüfen: **${oldWarnings.rows[0]?.count || 0}**
-` +
-          `• Abmeldungen im Blick behalten: **${weekAbsences.rows[0]?.count || 0}**`,
+          `⚠️ **Aktive Verwarnungen**\n└ ${activeWarnings.rows[0]?.count || 0}\n\n` +
+          `🕘 **Verwarnungen über 14 Tage**\n└ ${oldWarnings.rows[0]?.count || 0}\n\n` +
+          `📅 **Abmeldungen diese Woche**\n└ ${weekAbsences.rows[0]?.count || 0}\n\n` +
+          `📌 **OFFENE AUFGABEN**\n${taskText}`,
       },
       {
-        name: "👨‍💼 **Management — Offene Aufgaben**",
+        name: "👨‍💼 MANAGEMENT",
         value:
-          `• Aktive Stände prüfen: **${activeStands.rows[0]?.count || 0}**
-` +
-          `• Einkaufsliste kontrollieren
-` +
-          `• Lager alle 2 Tage prüfen`,
+          `🍽️ **Aktive Stände / Events**\n└ ${activeStands.rows[0]?.count || 0}\n\n` +
+          "🛒 **Einkaufsliste**\n└ Bitte regelmäßig kontrollieren.\n\n" +
+          "📦 **Lagerprüfung**\n└ Alle 2 Tage prüfen.",
       },
       {
-        name: activeSessions.rows.length > 0 ? "🟢 **Eingestempelte Mitarbeiter**" : "🔴 **Aktuell im Dienst**",
+        name: "🟢 EINGESTEMPELTE MITARBEITER",
         value: activeList,
       }
     )
-    .setFooter({ text: "Pearls • Dashboard & offene Aufgaben • Live aktualisiert" })
+    .setFooter({ text: "Pearls • Managementsystem • Live aktualisiert" })
     .setTimestamp();
 
   await sendOrUpdatePermanentMessage(DASHBOARD_CHANNEL_ID, "dashboard_message_id", {
@@ -1809,29 +1930,42 @@ async function buildEmployeeCheckEmbed(userId) {
 }
 
 async function updateWeeklyStatisticsMessage() {
-  const topWeekly = await query(`
-    SELECT user_id, weekly_minutes
-    FROM employees
-    WHERE left_server = FALSE
-    ORDER BY weekly_minutes DESC
-    LIMIT 5
-  `);
+  const trackedIds = await getTrackedEmployeeIds();
 
-  const topTotal = await query(`
-    SELECT user_id, total_minutes
-    FROM employees
-    WHERE left_server = FALSE
-    ORDER BY total_minutes DESC
-    LIMIT 5
-  `);
+  const topWeekly = trackedIds.length
+    ? await query(`
+        SELECT user_id, weekly_minutes
+        FROM employees
+        WHERE left_server = FALSE
+          AND user_id = ANY($1::text[])
+        ORDER BY weekly_minutes DESC
+        LIMIT 5
+      `, [trackedIds])
+    : asQueryRows([]);
+
+  const topTotal = trackedIds.length
+    ? await query(`
+        SELECT user_id, total_minutes
+        FROM employees
+        WHERE left_server = FALSE
+          AND user_id = ANY($1::text[])
+        ORDER BY total_minutes DESC
+        LIMIT 5
+      `, [trackedIds])
+    : asQueryRows([]);
 
   const activeWarnings = await query(`SELECT COUNT(*)::int AS count FROM warning_records WHERE active = TRUE`);
-  const activeSessions = await query(`SELECT COUNT(*)::int AS count FROM active_sessions`);
-  const employeeStats = await query(`
-    SELECT COUNT(*)::int AS count, COALESCE(AVG(weekly_minutes), 0)::int AS avg_weekly
-    FROM employees
-    WHERE left_server = FALSE
-  `);
+  const activeSessions = trackedIds.length
+    ? await query(`SELECT COUNT(*)::int AS count FROM active_sessions WHERE user_id = ANY($1::text[])`, [trackedIds])
+    : asQueryRows([{ count: 0 }]);
+  const employeeStats = trackedIds.length
+    ? await query(`
+        SELECT COUNT(*)::int AS count, COALESCE(AVG(weekly_minutes), 0)::int AS avg_weekly
+        FROM employees
+        WHERE left_server = FALSE
+          AND user_id = ANY($1::text[])
+      `, [trackedIds])
+    : asQueryRows([{ count: 0, avg_weekly: 0 }]);
   const absences = await query(`
     SELECT COUNT(*)::int AS count
     FROM absences
@@ -1864,7 +1998,7 @@ async function updateWeeklyStatisticsMessage() {
           `📅 **Abmeldungen diese Woche:** ${absences.rows[0]?.count || 0}`,
       }
     )
-    .setFooter({ text: "Pearls • Weekly Statistik • Aktualisiert automatisch" })
+    .setFooter({ text: "Pearls • Weekly Statistik • Nur Probe-Mitarbeiter & Mitarbeiter" })
     .setTimestamp();
 
   await sendOrUpdatePermanentMessage(STATISTICS_WEEKLY_CHANNEL_ID, "weekly_statistics_message_id", {
@@ -2300,6 +2434,51 @@ function parseBusinessTimeLogMessage(message) {
   };
 }
 
+async function setDutyRoleForUser(userId, enabled) {
+  const guild = await client.guilds.fetch(GUILD_ID).catch(() => null);
+  const member = await guild?.members.fetch(userId).catch(() => null);
+  if (!member) return null;
+
+  if (enabled) await member.roles.add(DUTY_ROLE_ID, "Automatische Dienst-Erkennung über IC-Foodbusiness").catch(() => null);
+  else await member.roles.remove(DUTY_ROLE_ID, "Automatische Dienst-Erkennung über IC-Foodbusiness").catch(() => null);
+
+  return member;
+}
+
+async function processBusinessClockInFromLog(parsed, linkedUser) {
+  if (!parsed || !linkedUser) return { ok: false, reason: "missing_data" };
+
+  await ensureEmployee(linkedUser.user_id);
+  await query(`UPDATE employees SET left_server = FALSE WHERE user_id = $1`, [linkedUser.user_id]).catch(() => null);
+
+  await query(
+    `
+    INSERT INTO active_sessions (user_id, started_at)
+    VALUES ($1, NOW())
+    ON CONFLICT (user_id) DO NOTHING;
+    `,
+    [linkedUser.user_id]
+  );
+
+  await query(
+    `
+    UPDATE active_sessions
+    SET pause_started_at = NULL,
+        reminder_message_id = NULL,
+        reminder_sent_at = NULL,
+        reminder_deadline_at = NULL
+    WHERE user_id = $1;
+    `,
+    [linkedUser.user_id]
+  ).catch(() => null);
+
+  await setDutyRoleForUser(linkedUser.user_id, true);
+  await sendTimeLog("in", `<@${linkedUser.user_id}>`, `Automatisch über IC-Foodbusiness erkannt.\n🧾 Name: **${parsed.employeeName}**`);
+  await refreshAllTimeDisplays();
+
+  return { ok: true };
+}
+
 async function importBusinessTimeFromLog(parsed, linkedUser) {
   if (!parsed || !linkedUser) return { ok: false, reason: "missing_data" };
 
@@ -2353,6 +2532,8 @@ async function importBusinessTimeFromLog(parsed, linkedUser) {
       [linkedUser.user_id, minutes]
     );
 
+    await db.query(`DELETE FROM active_sessions WHERE user_id = $1`, [linkedUser.user_id]);
+
     await db.query(
       `
       INSERT INTO work_sessions (user_id, started_at, ended_at, minutes, auto_clockout, corrected)
@@ -2362,6 +2543,9 @@ async function importBusinessTimeFromLog(parsed, linkedUser) {
     );
 
     await db.query("COMMIT");
+
+    await setDutyRoleForUser(linkedUser.user_id, false);
+    await sendTimeLog("out", `<@${linkedUser.user_id}>`, `Automatisch über IC-Foodbusiness erkannt.\n🕒 Gespeicherte Arbeitszeit: **${formatShortMinutes(minutes)}**\n🧾 Name: **${parsed.employeeName}**`);
 
     console.log("✅ Business-Zeit automatisch eingetragen:", {
       name: parsed.employeeName,
@@ -2382,7 +2566,18 @@ async function importBusinessTimeFromLog(parsed, linkedUser) {
 
 client.on("messageCreate", async (message) => {
   try {
-    if (!message.guildId || message.channelId !== BUSINESS_TIME_LOG_CHANNEL_ID) return;
+    if (!message.guildId) return;
+
+    if (message.channelId === MONEY_LOG_CHANNEL_ID) {
+      console.log("💸 Geld-Log erkannt:", {
+        messageId: message.id,
+        channelId: message.channelId,
+        preview: collectEmbedTextForBusinessTimeLog(message).slice(0, 500),
+      });
+      return;
+    }
+
+    if (message.channelId !== BUSINESS_TIME_LOG_CHANNEL_ID) return;
 
     const parsed = parseBusinessTimeLogMessage(message);
 
@@ -2416,24 +2611,149 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
-    if (parsed.action !== "ausgestempelt") {
-      console.log(`ℹ️ ${parsed.employeeName} hat sich eingestempelt. Zeit wird erst beim Ausstempeln übernommen.`);
+    if (parsed.action === "eingestempelt") {
+      const result = await processBusinessClockInFromLog(parsed, linkedUser);
+      if (!result.ok) console.log("ℹ️ Business-Einstempelung wurde nicht übernommen:", result.reason);
       return;
     }
 
-    const importResult = await importBusinessTimeFromLog(parsed, linkedUser);
+    if (parsed.action === "ausgestempelt") {
+      const importResult = await importBusinessTimeFromLog(parsed, linkedUser);
 
-    if (importResult.ok) {
-      await updateTotalWorktimeMessage().catch((err) => console.error("⚠️ Gesamtzeit konnte nach Business-Import nicht aktualisiert werden:", err));
-      await updateWeeklyWorktimeMessage().catch((err) => console.error("⚠️ Wochenzeit konnte nach Business-Import nicht aktualisiert werden:", err));
-      await updateDashboardMessage().catch((err) => console.error("⚠️ Dashboard konnte nach Business-Import nicht aktualisiert werden:", err));
-    } else {
-      console.log("ℹ️ Business-Zeit wurde nicht eingetragen:", importResult.reason);
+      if (importResult.ok) {
+        await updateTotalWorktimeMessage().catch((err) => console.error("⚠️ Gesamtzeit konnte nach Business-Import nicht aktualisiert werden:", err));
+        await updateWeeklyWorktimeMessage().catch((err) => console.error("⚠️ Wochenzeit konnte nach Business-Import nicht aktualisiert werden:", err));
+        await updateDashboardMessage().catch((err) => console.error("⚠️ Dashboard konnte nach Business-Import nicht aktualisiert werden:", err));
+      } else {
+        console.log("ℹ️ Business-Zeit wurde nicht eingetragen:", importResult.reason);
+      }
     }
   } catch (err) {
     console.error("❌ Fehler beim Business-Zeitlog-Scanner:", err);
   }
 });
+
+function formatGermanDateKey(dateKey) {
+  const [year, month, day] = String(dateKey).split("-");
+  return `${day}.${month}.${year}`;
+}
+
+function isPastDateKey(dateKey) {
+  return String(dateKey) < getBerlinDateKey();
+}
+
+function getTimeZoneOffsetMs(date, timeZone) {
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    hour12: false,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+
+  const parts = Object.fromEntries(formatter.formatToParts(date).map((p) => [p.type, p.value]));
+  const asUTC = Date.UTC(
+    Number(parts.year),
+    Number(parts.month) - 1,
+    Number(parts.day),
+    Number(parts.hour),
+    Number(parts.minute),
+    Number(parts.second)
+  );
+
+  return asUTC - date.getTime();
+}
+
+function zonedTimeToDate(year, month, day, hour, minute, timeZone = "Europe/Berlin") {
+  const utcGuess = new Date(Date.UTC(year, month - 1, day, hour, minute, 0));
+  const offset = getTimeZoneOffsetMs(utcGuess, timeZone);
+  return new Date(utcGuess.getTime() - offset);
+}
+
+function parseBerlinClockTimeToday(raw) {
+  const match = String(raw || "").trim().match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) return null;
+
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+
+  if (!Number.isInteger(hour) || !Number.isInteger(minute) || hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+    return null;
+  }
+
+  const p = getBerlinParts();
+  return zonedTimeToDate(Number(p.year), Number(p.month), Number(p.day), hour, minute);
+}
+
+function dienstCorrectionButtons(correctionId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`dienst_correction_book_${correctionId}`)
+      .setLabel("Buchen")
+      .setEmoji("✅")
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`dienst_correction_cancel_${correctionId}`)
+      .setLabel("Abbrechen")
+      .setEmoji("❌")
+      .setStyle(ButtonStyle.Danger)
+  );
+}
+
+async function applyDienstCorrection(draft) {
+  const active = await query(`SELECT * FROM active_sessions WHERE user_id = $1`, [draft.targetUserId]);
+  const session = active.rows[0];
+
+  if (!session) {
+    return { ok: false, reason: "not_active" };
+  }
+
+  const endAt = new Date(draft.endAt);
+  const startedAt = new Date(session.started_at);
+
+  if (endAt <= startedAt) {
+    return { ok: false, reason: "end_before_start" };
+  }
+
+  if (endAt.getTime() > Date.now() + 60_000) {
+    return { ok: false, reason: "future_time" };
+  }
+
+  const finished = await finishSession(draft.targetUserId, false, endAt);
+  if (!finished) return { ok: false, reason: "finish_failed" };
+
+  await query(
+    `INSERT INTO personnel_events (user_id, issuer_id, event_type, details) VALUES ($1, $2, $3, $4)`,
+    [draft.targetUserId, draft.issuerId, "Dienst-Korrektur", `Endzeit ${draft.endTimeRaw} • Grund: ${draft.reason}`]
+  ).catch(() => null);
+
+  const logChannel = await client.channels.fetch(TIME_LOG_CHANNEL_ID).catch(() => null);
+  if (logChannel) {
+    const embed = new EmbedBuilder()
+      .setColor(0x5dade2)
+      .setTitle("🛠️ ・DIENST-KORREKTUR GEBUCHT")
+      .setDescription(
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+          `👤 **Mitarbeiter**\n└ <@${draft.targetUserId}>\n\n` +
+          `🕒 **Endzeit**\n└ ${draft.endTimeRaw} Uhr\n\n` +
+          `📌 **Grund**\n└ ${draft.reason}\n\n` +
+          `📊 **Gebuchte Zeit**\n└ ${formatShortMinutes(finished.minutes)}\n\n` +
+          `👮 **Gebucht von**\n└ <@${draft.issuerId}>\n` +
+          "━━━━━━━━━━━━━━━━━━━━━━━━"
+      )
+      .setFooter({ text: "Pearls • Dienst-Korrektur" })
+      .setTimestamp();
+
+    await logChannel.send({ embeds: [embed] }).catch(() => null);
+  }
+
+  await refreshAllTimeDisplays();
+
+  return { ok: true, minutes: finished.minutes };
+}
 
 const BOT_STATUS_ROTATION = [
   "Made by Kquwi♱",
@@ -2486,7 +2806,7 @@ async function startBotOnce() {
     await updateManagementTasksMessage();
     await sendStockCheckReminderIfNeeded(true);
 
-    setInterval(checkReminders, 60 * 1000);
+    // Altes manuelles Aktivitäts-/Reminder-System ist deaktiviert. Dienstzeiten laufen über IC-Foodbusiness-Logs.
     setInterval(updateTotalWorktimeMessage, 2 * 60 * 1000);
     setInterval(updateWeeklyWorktimeMessage, 2 * 60 * 1000);
     setInterval(updateDashboardMessage, 2 * 60 * 1000);
@@ -2496,7 +2816,7 @@ async function startBotOnce() {
     setInterval(weeklyResetOnly, 60 * 1000);
     setInterval(checkWarningReviewReminders, 60 * 60 * 1000);
 
-    console.log("✅ Stempel-Uhr System gestartet.");
+    console.log("✅ Automatisches Dienstzeit-System gestartet.");
   } catch (err) {
     console.error("❌ Fehler beim Start:", err);
   }
@@ -2530,45 +2850,52 @@ client.on("guildMemberAdd", async (member) => {
 });
 
 client.on("guildMemberUpdate", async (oldMember, newMember) => {
-  const hadRole = oldMember.roles.cache.has(EMPLOYEE_ROLE_ID);
-  const hasRole = newMember.roles.cache.has(EMPLOYEE_ROLE_ID);
+  const hadEmployeeRole = oldMember.roles.cache.has(EMPLOYEE_ROLE_ID);
+  const hasEmployeeRole = newMember.roles.cache.has(EMPLOYEE_ROLE_ID);
 
   const hadProbeRole = oldMember.roles.cache.has(PROBE_ROLE_ID);
   const hasProbeRole = newMember.roles.cache.has(PROBE_ROLE_ID);
 
-  if (!hadProbeRole && hasProbeRole) {
+  const hadManagementRole = MANAGEMENT_TEAMUPDATE_ROLE_IDS.some((roleId) => oldMember.roles.cache.has(roleId));
+  const hasManagementRole = MANAGEMENT_TEAMUPDATE_ROLE_IDS.some((roleId) => newMember.roles.cache.has(roleId));
+
+  if (hasEmployeeRole || hasProbeRole || hasManagementRole) {
+    await ensureRequiredCompanionRoles(newMember).catch((err) => console.error("❌ Zusatzrollen konnten nicht synchronisiert werden:", err));
     await ensureEmployee(newMember.id);
     await query(`UPDATE employees SET left_server = FALSE WHERE user_id = $1`, [newMember.id]);
-    await autoLinkBusinessNameFromMember(newMember, "Probe-Mitarbeiter-Rolle erhalten");
-    await updateTotalWorktimeMessage();
-    await updateWeeklyWorktimeMessage();
-    console.log(`✅ ${newMember.user.tag} wurde durch Probezeit-Rolle in die Zeitliste aufgenommen.`);
+    await autoLinkBusinessNameFromMember(newMember, "Mitarbeiter-/Managementrolle vorhanden");
   }
 
-  if (!hadRole && hasRole) {
-    await ensureEmployee(newMember.id);
-    await query(`UPDATE employees SET left_server = FALSE WHERE user_id = $1`, [newMember.id]);
-    await autoLinkBusinessNameFromMember(newMember, "Mitarbeiter-Rolle erhalten");
-    await updateTotalWorktimeMessage();
-    await updateWeeklyWorktimeMessage();
+  if (!hadProbeRole && hasProbeRole) {
+    console.log(`✅ ${newMember.user.tag} wurde durch Probe-Mitarbeiter-Rolle in die Zeitliste aufgenommen.`);
+  }
+
+  if (!hadEmployeeRole && hasEmployeeRole) {
     console.log(`✅ ${newMember.user.tag} wurde als Mitarbeiter hinzugefügt.`);
+  }
+
+  if (!hadManagementRole && hasManagementRole) {
+    console.log(`✅ ${newMember.user.tag} wurde durch Management-Rolle als Mitarbeiter synchronisiert.`);
   }
 
   const oldDisplayName = String(oldMember.nickname || oldMember.displayName || oldMember.user?.globalName || oldMember.user?.username || "");
   const newDisplayName = String(newMember.nickname || newMember.displayName || newMember.user?.globalName || newMember.user?.username || "");
 
-  if ((hasProbeRole || hasRole) && oldDisplayName !== newDisplayName) {
+  if ((hasProbeRole || hasEmployeeRole || hasManagementRole) && oldDisplayName !== newDisplayName) {
     await autoLinkBusinessNameFromMember(newMember, "Nickname/Name geändert während Mitarbeiterrolle vorhanden ist");
   }
 
-  if (hadRole && !hasRole) {
+  const isStillTracked = hasProbeRole || hasEmployeeRole;
+  if ((hadProbeRole || hadEmployeeRole) && !isStillTracked && !hasManagementRole) {
     await query(`UPDATE employees SET left_server = TRUE WHERE user_id = $1`, [newMember.id]);
     await query(`DELETE FROM active_sessions WHERE user_id = $1`, [newMember.id]);
     await newMember.roles.remove(DUTY_ROLE_ID).catch(() => {});
-    await updateTotalWorktimeMessage();
-    await updateWeeklyWorktimeMessage();
     console.log(`❌ ${newMember.user.tag} wurde aus den Listen entfernt.`);
   }
+
+  await updateTotalWorktimeMessage().catch(() => null);
+  await updateWeeklyWorktimeMessage().catch(() => null);
+  await updateDashboardMessage().catch(() => null);
 });
 
 client.on("interactionCreate", async (interaction) => {
@@ -2581,25 +2908,23 @@ client.on("interactionCreate", async (interaction) => {
         }
 
         const embed = new EmbedBuilder()
-          .setColor(0x2ecc71)
-          .setTitle("⏰ ・STEMPEL-UHR")
+          .setColor(0x5dade2)
+          .setTitle("⏱️ ・AUTOMATISCHE DIENSTZEIT")
           .setDescription(
             "━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-              "Starte oder beende hier deinen Dienst.\n\n" +
+              "Das alte manuelle Stempelsystem ist deaktiviert.\n\n" +
               "🟢 **Einstempeln**\n" +
-              "└ Dienst starten und Arbeitszeit erfassen\n\n" +
+              "└ Wird automatisch über die IC-Foodbusiness-Zeitstempel erkannt.\n\n" +
               "🔴 **Ausstempeln**\n" +
-              "└ Dienst beenden und Zeit speichern\n\n" +
-              "⏸️ **Pause starten**\n" +
-              "└ Arbeitszeit pausieren\n\n" +
-              "▶️ **Pause beenden**\n" +
-              "└ Arbeitszeit wieder fortsetzen\n" +
+              "└ Zeit wird automatisch aus dem IC-Foodbusiness-Log übernommen.\n\n" +
+              "🛠️ **Crash / Fehler**\n" +
+              "└ Nutze `/dienst-korrektur`, um eine Endzeit sauber zu buchen.\n" +
               "━━━━━━━━━━━━━━━━━━━━━━━━"
           )
-          .setFooter({ text: "Pearls • Professionelles Arbeitszeitsystem" })
+          .setFooter({ text: "Pearls • Automatisches Dienstzeitsystem" })
           .setTimestamp();
 
-        return interaction.reply({ embeds: [embed], components: [clockButtons()] });
+        return interaction.reply({ embeds: [embed] });
       }
 
       if (interaction.commandName === "mitarbeiterpanel") {
@@ -2786,6 +3111,59 @@ client.on("interactionCreate", async (interaction) => {
         return;
       }
 
+      if (interaction.commandName === "dienst-korrektur") {
+        if (!canManagePersonal(interaction.member)) {
+          return interaction.reply({ content: "❌ Du darfst keine Dienstzeiten korrigieren.", ephemeral: true });
+        }
+
+        const target = interaction.options.getUser("user", true);
+        const endTimeRaw = interaction.options.getString("endzeit", true).trim();
+        const reason = interaction.options.getString("grund", true).trim();
+        const endAt = parseBerlinClockTimeToday(endTimeRaw);
+
+        if (!endAt) {
+          return interaction.reply({ content: "❌ Bitte gib die Endzeit im Format `HH:MM` ein, z. B. `19:30`.", ephemeral: true });
+        }
+
+        if (endAt.getTime() > Date.now() + 60_000) {
+          return interaction.reply({ content: "❌ Die Endzeit darf nicht in der Zukunft liegen.", ephemeral: true });
+        }
+
+        const active = await query(`SELECT started_at FROM active_sessions WHERE user_id = $1`, [target.id]);
+        if (!active.rows[0]) {
+          return interaction.reply({ content: `❌ ${target} ist aktuell nicht als im Dienst eingetragen.`, ephemeral: true });
+        }
+
+        if (endAt <= new Date(active.rows[0].started_at)) {
+          return interaction.reply({ content: "❌ Die Endzeit liegt vor dem Dienstbeginn. Bitte prüfe die Uhrzeit.", ephemeral: true });
+        }
+
+        const correctionId = interaction.id;
+        serviceCorrectionDrafts.set(correctionId, {
+          targetUserId: target.id,
+          issuerId: interaction.user.id,
+          endAt: endAt.toISOString(),
+          endTimeRaw,
+          reason,
+        });
+
+        const embed = new EmbedBuilder()
+          .setColor(0xf1c40f)
+          .setTitle("🛠️ ・DIENST-KORREKTUR PRÜFEN")
+          .setDescription(
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+              `👤 **Mitarbeiter**\n└ ${target}\n\n` +
+              `🕒 **Endzeit**\n└ ${endTimeRaw} Uhr\n\n` +
+              `📌 **Grund**\n└ ${reason}\n\n` +
+              "Bitte bestätige, ob diese Korrektur gebucht werden soll.\n" +
+              "━━━━━━━━━━━━━━━━━━━━━━━━"
+          )
+          .setFooter({ text: "Pearls • Dienst-Korrektur" })
+          .setTimestamp();
+
+        return interaction.reply({ embeds: [embed], components: [dienstCorrectionButtons(correctionId)], ephemeral: true });
+      }
+
       if (interaction.commandName === "dashboard") {
         if (!canManagePersonal(interaction.member)) {
           return interaction.reply({ content: "❌ Du darfst das Dashboard nicht aktualisieren.", ephemeral: true });
@@ -2816,28 +3194,7 @@ client.on("interactionCreate", async (interaction) => {
           return interaction.reply({ content: "❌ Du darfst dieses Panel nicht erstellen.", ephemeral: true });
         }
 
-        const embed = new EmbedBuilder()
-          .setColor(0x5dade2)
-          .setTitle("🛠️ ・ZEITVERWALTUNG")
-          .setDescription(
-            "━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-              "Verwalte hier die Arbeitszeiten von Mitarbeitern.\n\n" +
-              "➕ **Zeit hinzufügen**\n" +
-              "└ Erhöht Weekly und Gesamtzeit\n\n" +
-              "➖ **Zeit entfernen**\n" +
-              "└ Zieht Zeit von Weekly und Gesamtzeit ab\n\n" +
-              "🔄 **Weekly setzen**\n" +
-              "└ Setzt nur die aktuelle Weekly-Zeit\n\n" +
-              "🏆 **Gesamtzeit setzen**\n" +
-              "└ Setzt nur die Gesamtzeit\n\n" +
-              "📊 **Zeiten ansehen**\n" +
-              "└ Zeigt aktuelle Zeiten und letzte Änderungen\n" +
-              "━━━━━━━━━━━━━━━━━━━━━━━━"
-          )
-          .setFooter({ text: "Pearls • Zeitverwaltung" })
-          .setTimestamp();
-
-        return interaction.reply({ embeds: [embed], components: timeManagementPanelRows() });
+        return interaction.reply({ embeds: [buildTimeManagementPanelEmbed()], components: timeManagementPanelRows() });
       }
 
       if (interaction.commandName === "mitarbeitercheck") {
@@ -3033,6 +3390,66 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     if (interaction.isButton()) {
+      if (interaction.customId === "mgmt_time_start") {
+        if (!canManagePersonal(interaction.member)) {
+          return interaction.reply({ content: "❌ Du darfst die Zeitverwaltung nicht nutzen.", ephemeral: true });
+        }
+
+        return interaction.reply({
+          embeds: [buildTimeManagementPanelEmbed()],
+          components: timeManagementPanelRows(),
+          ephemeral: true,
+        });
+      }
+
+      if (interaction.customId.startsWith("dienst_correction_book_") || interaction.customId.startsWith("dienst_correction_cancel_")) {
+        const isBooking = interaction.customId.startsWith("dienst_correction_book_");
+        const correctionId = interaction.customId.replace(isBooking ? "dienst_correction_book_" : "dienst_correction_cancel_", "");
+        const draft = serviceCorrectionDrafts.get(correctionId);
+
+        if (!draft) {
+          return interaction.reply({ content: "❌ Diese Dienst-Korrektur ist nicht mehr verfügbar. Bitte den Command neu ausführen.", ephemeral: true });
+        }
+
+        if (interaction.user.id !== draft.issuerId && !canManagePersonal(interaction.member)) {
+          return interaction.reply({ content: "❌ Du darfst diese Korrektur nicht bestätigen.", ephemeral: true });
+        }
+
+        if (!isBooking) {
+          serviceCorrectionDrafts.delete(correctionId);
+          return interaction.update({ content: "❌ Dienst-Korrektur wurde abgebrochen. Es wurde nichts gebucht.", embeds: [], components: [] });
+        }
+
+        const result = await applyDienstCorrection(draft);
+        serviceCorrectionDrafts.delete(correctionId);
+
+        if (!result.ok) {
+          const reasons = {
+            not_active: "Der Mitarbeiter ist nicht mehr im Dienst eingetragen.",
+            end_before_start: "Die Endzeit liegt vor dem Dienstbeginn.",
+            future_time: "Die Endzeit liegt in der Zukunft.",
+            finish_failed: "Die Sitzung konnte nicht abgeschlossen werden.",
+          };
+          return interaction.update({
+            content: `❌ Dienst-Korrektur konnte nicht gebucht werden: ${reasons[result.reason] || result.reason}`,
+            embeds: [],
+            components: [],
+          });
+        }
+
+        return interaction.update({
+          content: `✅ Dienst-Korrektur wurde gebucht. Gespeicherte Arbeitszeit: **${formatShortMinutes(result.minutes)}**`,
+          embeds: [],
+          components: [],
+        });
+      }
+
+      if (["clock_in", "clock_out", "pause_start", "pause_end"].includes(interaction.customId)) {
+        return interaction.reply({
+          content: "ℹ️ Das alte manuelle Stempelsystem ist deaktiviert. Dienstzeiten werden automatisch über die IC-Foodbusiness-Zeitstempel erkannt. Nutze bei Crash bitte `/dienst-korrektur`.",
+          ephemeral: true,
+        });
+      }
       if (
         interaction.customId === "time_add_start" ||
         interaction.customId === "time_remove_start" ||
@@ -3394,9 +3811,17 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       if (interaction.customId === "open_absence_modal") {
+        const defaultName = (cleanBusinessNameFromMember(interaction.member) || interaction.member?.displayName || interaction.user.username || "").slice(0, 100);
         const modal = new ModalBuilder().setCustomId("absence_modal").setTitle("Abmeldung erstellen");
         modal.addComponents(
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("absence_name").setLabel("Name").setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId("absence_name")
+              .setLabel("Name")
+              .setValue(defaultName)
+              .setStyle(TextInputStyle.Short)
+              .setRequired(true)
+          ),
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("absence_from").setLabel("Von").setPlaceholder("TT.MM.JJJJ").setStyle(TextInputStyle.Short).setRequired(true)),
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("absence_to").setLabel("Bis").setPlaceholder("TT.MM.JJJJ").setStyle(TextInputStyle.Short).setRequired(true)),
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("absence_reason").setLabel("Grund").setStyle(TextInputStyle.Paragraph).setRequired(true))
@@ -3852,7 +4277,7 @@ ${nicknameText}${roleText}`,
       }
 
       if (interaction.customId === "absence_modal") {
-        const name = interaction.fields.getTextInputValue("absence_name");
+        const name = formatName(interaction.fields.getTextInputValue("absence_name"));
         const fromRaw = interaction.fields.getTextInputValue("absence_from");
         const toRaw = interaction.fields.getTextInputValue("absence_to");
         const reason = interaction.fields.getTextInputValue("absence_reason");
@@ -3861,7 +4286,11 @@ ${nicknameText}${roleText}`,
         const to = parseGermanDate(toRaw);
 
         if (!from || !to || from > to) {
-          return interaction.reply({ content: "❌ Bitte gib gültige Daten im Format TT.MM.JJJJ ein.", ephemeral: true });
+          return interaction.reply({ content: "❌ Bitte gib gültige Daten im Format TT.MM.JJJJ ein. Das Bis-Datum darf nicht vor dem Von-Datum liegen.", ephemeral: true });
+        }
+
+        if (isPastDateKey(from) || isPastDateKey(to)) {
+          return interaction.reply({ content: "❌ Vergangene Tage können nicht mehr für eine Abmeldung eingetragen werden.", ephemeral: true });
         }
 
         await query(
@@ -3875,13 +4304,14 @@ ${nicknameText}${roleText}`,
           .setTitle("❌ Neue Abmeldung")
           .addFields(
             { name: "Name", value: name },
-            { name: "Zeitraum", value: `${fromRaw} bis ${toRaw}` },
+            { name: "Zeitraum", value: `${formatGermanDateKey(from)} bis ${formatGermanDateKey(to)}` },
             { name: "Grund", value: reason },
             { name: "Erstellt von", value: `<@${interaction.user.id}>` }
           )
           .setTimestamp();
 
         await channel.send({ embeds: [embed] });
+        await updateDashboardMessage().catch(() => null);
         return interaction.reply({ content: "✅ Abmeldung wurde eingetragen.", ephemeral: true });
       }
 
@@ -4024,8 +4454,15 @@ ${nicknameText}${roleText}`,
           )
           .setTimestamp();
 
-        await channel.send({ content: `<@&${MANAGER_ROLE_ID}>`, embeds: [embed], components: [applicationButtons()] });
-        return interaction.reply({ content: "✅ Bewerbung wurde eingereicht.", ephemeral: true });
+        const msg = await channel.send({ content: `<@&${MANAGER_ROLE_ID}>`, embeds: [embed], components: [applicationButtons()] });
+
+        await msg.startThread({
+          name: `Bewerbung - ${name}`.slice(0, 100),
+          autoArchiveDuration: 10080,
+          reason: "Automatischer Bewerbungs-Thread",
+        }).catch((err) => console.error("❌ Bewerbungs-Thread konnte nicht erstellt werden:", err));
+
+        return interaction.reply({ content: "✅ Bewerbung wurde eingereicht und ein Bewerbungs-Thread wurde erstellt.", ephemeral: true });
       }
 
       if (interaction.customId === "ban_modal") {
