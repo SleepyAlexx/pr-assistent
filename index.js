@@ -2974,16 +2974,18 @@ client.on("interactionCreate", async (interaction) => {
           .setDescription(
             "━━━━━━━━━━━━━━━━━━━━━━━━\n" +
               "Verwalte hier das Team des **Pearls**.\n\n" +
-              "⚠️ **Verwarnung**\n" +
-              "└ Normale Verwarnung ausstellen\n\n" +
-              "🎉 **Teamupdate**\n" +
+              "🧠 **Einweisung**\n" +
+              "└ Einweisung dokumentieren\n\n" +
+              "🔄 **Teamupdate**\n" +
               "└ Beförderungen und Rollenänderungen\n\n" +
               "📤 **Kündigung**\n" +
               "└ Mitarbeiter aus Zeitlisten entfernen\n\n" +
-              "🔄 **Verwarnung zurückziehen**\n" +
+              "⚠️ **Verwarnung**\n" +
+              "└ Normale Verwarnung ausstellen\n\n" +
+              "✅ **Verwarnung zurückziehen**\n" +
               "└ Aktive Verwarnung entfernen\n\n" +
-              "🧠 **Einweisung**\n" +
-              "└ Einweisung dokumentieren\n" +
+              "⏱️ **Zeitverwaltung**\n" +
+              "└ Zeiten ansehen und korrigieren\n" +
               "━━━━━━━━━━━━━━━━━━━━━━━━"
           )
           .setFooter({ text: "Pearls • Managementsystem • Premium Design" })
