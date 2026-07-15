@@ -3611,9 +3611,10 @@ client.on("interactionCreate", async (interaction) => {
           return interaction.reply({ content: "❌ Bitte User und Rolle/Änderung auswählen.", ephemeral: true });
         }
 
+        await interaction.deferReply({ ephemeral: true });
         await sendTeamUpdate(draft.targetUserId, draft.updateType, interaction.user.id);
         managementDrafts.delete(draftKey(interaction.user.id, "teamupdate"));
-        return interaction.reply({ content: "✅ Teamupdate wurde gesendet und die Rolle wurde vergeben.", ephemeral: true });
+        return interaction.editReply({ content: "✅ Teamupdate wurde gesendet und die Rolle wurde vergeben." });
       }
 
       if (interaction.customId === "mgmt_termination_continue") {
@@ -3633,9 +3634,11 @@ client.on("interactionCreate", async (interaction) => {
       if (interaction.customId === "mgmt_warning_remove_continue") {
         const draft = managementDrafts.get(draftKey(interaction.user.id, "warning_remove"));
         if (!draft?.targetUserId || !draft?.warningRoleId) return interaction.reply({ content: "❌ Bitte User und Verwarnung auswählen.", ephemeral: true });
+
+        await interaction.deferReply({ ephemeral: true });
         await sendWarningRemove(draft.targetUserId, draft.warningRoleId, interaction.user.id);
         managementDrafts.delete(draftKey(interaction.user.id, "warning_remove"));
-        return interaction.reply({ content: "✅ Zurückgezogene Verwarnung wurde gesendet.", ephemeral: true });
+        return interaction.editReply({ content: "✅ Zurückgezogene Verwarnung wurde gesendet." });
       }
 
       if (interaction.customId === "mgmt_training_continue") {
@@ -4181,9 +4184,10 @@ client.on("interactionCreate", async (interaction) => {
         if (!draft?.targetUserId || !draft?.warningRoleId) return interaction.reply({ content: "❌ Entwurf nicht gefunden. Bitte neu starten.", ephemeral: true });
 
         const reason = interaction.fields.getTextInputValue("warning_reason");
+        await interaction.deferReply({ ephemeral: true });
         await sendWarning(draft.targetUserId, draft.warningRoleId, reason, interaction.user.id);
         managementDrafts.delete(draftKey(interaction.user.id, "warning"));
-        return interaction.reply({ content: "✅ Verwarnung wurde gesendet.", ephemeral: true });
+        return interaction.editReply({ content: "✅ Verwarnung wurde gesendet." });
       }
 
       if (interaction.customId === "mgmt_termination_modal") {
@@ -4191,9 +4195,10 @@ client.on("interactionCreate", async (interaction) => {
         if (!draft?.targetUserId) return interaction.reply({ content: "❌ Entwurf nicht gefunden. Bitte neu starten.", ephemeral: true });
 
         const note = interaction.fields.getTextInputValue("termination_note");
+        await interaction.deferReply({ ephemeral: true });
         await sendTermination(draft.targetUserId, note, interaction.user.id);
         managementDrafts.delete(draftKey(interaction.user.id, "termination"));
-        return interaction.reply({ content: "✅ Kündigung wurde gesendet.", ephemeral: true });
+        return interaction.editReply({ content: "✅ Kündigung wurde gesendet." });
       }
 
       if (interaction.customId === "mgmt_training_modal") {
@@ -4201,9 +4206,10 @@ client.on("interactionCreate", async (interaction) => {
         if (!draft?.targetUserId || !draft?.instructorId) return interaction.reply({ content: "❌ Entwurf nicht gefunden. Bitte neu starten.", ephemeral: true });
 
         const date = interaction.fields.getTextInputValue("training_date");
+        await interaction.deferReply({ ephemeral: true });
         await sendTraining(draft.targetUserId, draft.instructorId, date, interaction.user.id);
         managementDrafts.delete(draftKey(interaction.user.id, "training"));
-        return interaction.reply({ content: "✅ Einweisung wurde dokumentiert.", ephemeral: true });
+        return interaction.editReply({ content: "✅ Einweisung wurde dokumentiert." });
       }
 
       if (interaction.customId.startsWith("correct_time_modal_")) {
