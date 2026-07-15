@@ -2936,8 +2936,6 @@ client.on("interactionCreate", async (interaction) => {
               "Willkommen im Mitarbeiterbereich des **Pearls**.\n\n" +
               "❌ **Abmeldung**\n" +
               "└ Melde dich für einen Zeitraum ab\n\n" +
-              "🍽️ **Essensstand/Event**\n" +
-              "└ Stelle eine Anfrage für einen Stand oder ein Event\n\n" +
               "🛒 **Einkauf**\n" +
               "└ Trage ein, was benötigt wird\n\n" +
               "📋 **Bewerbung**\n" +
@@ -2951,16 +2949,12 @@ client.on("interactionCreate", async (interaction) => {
 
         const row1 = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId("open_absence_modal").setLabel("Abmeldung").setEmoji("❌").setStyle(ButtonStyle.Danger),
-          new ButtonBuilder().setCustomId("open_request_menu").setLabel("Essensstand/Event").setEmoji("🍽️").setStyle(ButtonStyle.Primary)
-        );
-
-        const row2 = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId("open_shopping_modal").setLabel("Einkauf").setEmoji("🛒").setStyle(ButtonStyle.Success),
           new ButtonBuilder().setCustomId("open_application_modal").setLabel("Bewerbung").setEmoji("📋").setStyle(ButtonStyle.Secondary),
           new ButtonBuilder().setCustomId("open_ban_modal").setLabel("Hausverbot").setEmoji("🚫").setStyle(ButtonStyle.Danger)
         );
 
-        return interaction.reply({ embeds: [embed], components: [row1, row2] });
+        return interaction.reply({ embeds: [embed], components: [row1] });
       }
 
       if (interaction.commandName === "managementpanel") {
