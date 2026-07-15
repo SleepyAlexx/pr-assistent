@@ -127,6 +127,14 @@ const MANAGEMENT_TEAMUPDATE_ROLE_IDS = [
   TEAMUPDATE_PERSONAL_MANAGER_ROLE_ID,
 ];
 
+const ABSENCE_REVIEW_ROLE_IDS = [
+  OWNER_ROLE_ID,
+  CO_OWNER_ROLE_ID,
+  PERSONAL_MANAGER_ROLE_ID,
+  MANAGER_ROLE_ID,
+  ...FULL_ACCESS_ROLE_IDS,
+];
+
 
 const PROBE_RANKUP_MINUTES = 600;
 const REMINDER_AFTER_MS = 2 * 60 * 60 * 1000;
@@ -180,6 +188,11 @@ function canCreatePanels(member) {
 
 function canManagePersonal(member) {
   return hasLeadershipRole(member) || hasManagerRole(member) || isPersonalManager(member);
+}
+
+function canReviewAbsence(member) {
+  if (!member?.roles?.cache) return false;
+  return ABSENCE_REVIEW_ROLE_IDS.some((roleId) => member.roles.cache.has(roleId));
 }
 
 function formatMinutes(minutes) {
@@ -342,6 +355,11 @@ async function initDatabase() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
+
+  await query(`ALTER TABLE absences ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending';`);
+  await query(`ALTER TABLE absences ADD COLUMN IF NOT EXISTS reviewed_by TEXT;`);
+  await query(`ALTER TABLE absences ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ;`);
+  await query(`ALTER TABLE absences ADD COLUMN IF NOT EXISTS message_id TEXT;`);
 
   await query(`
     CREATE TABLE IF NOT EXISTS bot_settings (
@@ -665,6 +683,70 @@ function houseBanButtons() {
     new ButtonBuilder().setCustomId("ban_active").setLabel("Aktiv").setEmoji("🚫").setStyle(ButtonStyle.Danger),
     new ButtonBuilder().setCustomId("ban_expired").setLabel("Abgelaufen").setEmoji("✅").setStyle(ButtonStyle.Success)
   );
+}
+
+function absenceReviewButtons(absenceId, disabled = false) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`absence_approve_${absenceId}`)
+      .setLabel("Genehmigt")
+      .setEmoji("✅")
+      .setStyle(ButtonStyle.Success)
+      .setDisabled(disabled),
+    new ButtonBuilder()
+      .setCustomId(`absence_deny_${absenceId}`)
+      .setLabel("Abgelehnt")
+      .setEmoji("❌")
+      .setStyle(ButtonStyle.Danger)
+      .setDisabled(disabled)
+  );
+}
+
+function formatAbsenceDate(value) {
+  const dateKey = value instanceof Date ? value.toISOString().slice(0, 10) : String(value).slice(0, 10);
+  return formatGermanDateKey(dateKey);
+}
+
+function buildAbsenceEmbed(absence) {
+  const status = absence.status || "pending";
+  const reviewedAt = absence.reviewed_at
+    ? `\n└ <t:${Math.floor(new Date(absence.reviewed_at).getTime() / 1000)}:R>`
+    : "";
+
+  let color = 0xf1c40f;
+  let statusText = "🕒 **Offen**\n└ Wartet auf Genehmigung";
+
+  if (status === "approved") {
+    color = 0x2ecc71;
+    statusText = `✅ **Genehmigt**\n└ Von <@${absence.reviewed_by}>${reviewedAt}`;
+  }
+
+  if (status === "denied") {
+    color = 0xe74c3c;
+    statusText = `❌ **Abgelehnt**\n└ Von <@${absence.reviewed_by}>${reviewedAt}`;
+  }
+
+  return new EmbedBuilder()
+    .setColor(color)
+    .setTitle("📋 ・ABMELDUNG")
+    .setDescription(
+      "━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+        `**${absence.name}** hat eine Abmeldung eingereicht.\n` +
+        "━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+    .addFields(
+      { name: "👤 **Name**", value: absence.name || "Nicht angegeben", inline: true },
+      {
+        name: "📅 **Zeitraum**",
+        value: `**Von:** ${formatAbsenceDate(absence.date_from)}\n**Bis:** ${formatAbsenceDate(absence.date_to)}`,
+        inline: true,
+      },
+      { name: "📝 **Grund**", value: absence.reason || "Nicht angegeben", inline: false },
+      { name: "📨 **Eingereicht von**", value: `<@${absence.user_id}>`, inline: true },
+      { name: "📌 **Status**", value: statusText, inline: true }
+    )
+    .setFooter({ text: "Pearls • Abmeldung" })
+    .setTimestamp(absence.created_at ? new Date(absence.created_at) : new Date());
 }
 
 function foodButtons(creatorId) {
@@ -3398,6 +3480,66 @@ client.on("interactionCreate", async (interaction) => {
         });
       }
 
+      if (interaction.customId.startsWith("absence_approve_") || interaction.customId.startsWith("absence_deny_")) {
+        if (!canReviewAbsence(interaction.member)) {
+          return interaction.reply({
+            content: "❌ Du darfst Abmeldungen nicht genehmigen oder ablehnen. Erlaubt sind Geschäftsführung, stellv. Geschäftsführung, Personal Managerin und Manager.",
+            ephemeral: true,
+          });
+        }
+
+        const approved = interaction.customId.startsWith("absence_approve_");
+        const absenceId = Number(interaction.customId.replace(approved ? "absence_approve_" : "absence_deny_", ""));
+
+        if (!absenceId || Number.isNaN(absenceId)) {
+          return interaction.reply({ content: "❌ Diese Abmeldung konnte nicht erkannt werden.", ephemeral: true });
+        }
+
+        await interaction.deferUpdate();
+
+        const current = await query(`SELECT * FROM absences WHERE id = $1`, [absenceId]);
+        const oldAbsence = current.rows[0];
+
+        if (!oldAbsence) {
+          return interaction.followUp({ content: "❌ Diese Abmeldung wurde nicht mehr gefunden.", ephemeral: true });
+        }
+
+        if (oldAbsence.status && oldAbsence.status !== "pending") {
+          const embed = buildAbsenceEmbed(oldAbsence);
+          await interaction.message.edit({ embeds: [embed], components: [absenceReviewButtons(absenceId, true)] }).catch(() => null);
+          return interaction.followUp({ content: "ℹ️ Diese Abmeldung wurde bereits bearbeitet.", ephemeral: true });
+        }
+
+        const newStatus = approved ? "approved" : "denied";
+        const updated = await query(
+          `
+          UPDATE absences
+          SET status = $2,
+              reviewed_by = $3,
+              reviewed_at = NOW(),
+              message_id = COALESCE(message_id, $4)
+          WHERE id = $1
+          RETURNING *;
+          `,
+          [absenceId, newStatus, interaction.user.id, interaction.message.id]
+        );
+
+        const absence = updated.rows[0];
+        const embed = buildAbsenceEmbed(absence);
+
+        await interaction.message.edit({
+          embeds: [embed],
+          components: [absenceReviewButtons(absenceId, true)],
+        });
+
+        await updateDashboardMessage().catch(() => null);
+
+        return interaction.followUp({
+          content: approved ? "✅ Abmeldung wurde genehmigt." : "❌ Abmeldung wurde abgelehnt.",
+          ephemeral: true,
+        });
+      }
+
       if (interaction.customId.startsWith("dienst_correction_book_") || interaction.customId.startsWith("dienst_correction_cancel_")) {
         const isBooking = interaction.customId.startsWith("dienst_correction_book_");
         const correctionId = interaction.customId.replace(isBooking ? "dienst_correction_book_" : "dienst_correction_cancel_", "");
@@ -4295,26 +4437,25 @@ ${nicknameText}${roleText}`,
           return interaction.reply({ content: "❌ Vergangene Tage können nicht mehr für eine Abmeldung eingetragen werden.", ephemeral: true });
         }
 
-        await query(
-          `INSERT INTO absences (user_id, name, date_from, date_to, reason) VALUES ($1, $2, $3, $4, $5)`,
+        const inserted = await query(
+          `
+          INSERT INTO absences (user_id, name, date_from, date_to, reason, status)
+          VALUES ($1, $2, $3, $4, $5, 'pending')
+          RETURNING *;
+          `,
           [interaction.user.id, name, from, to, reason]
         );
 
+        const absence = inserted.rows[0];
         const channel = await client.channels.fetch(ABSENCE_CHANNEL_ID);
-        const embed = new EmbedBuilder()
-          .setColor(0xe74c3c)
-          .setTitle("❌ Neue Abmeldung")
-          .addFields(
-            { name: "Name", value: name },
-            { name: "Zeitraum", value: `${formatGermanDateKey(from)} bis ${formatGermanDateKey(to)}` },
-            { name: "Grund", value: reason },
-            { name: "Erstellt von", value: `<@${interaction.user.id}>` }
-          )
-          .setTimestamp();
+        const message = await channel.send({
+          embeds: [buildAbsenceEmbed(absence)],
+          components: [absenceReviewButtons(absence.id)],
+        });
 
-        await channel.send({ embeds: [embed] });
+        await query(`UPDATE absences SET message_id = $2 WHERE id = $1`, [absence.id, message.id]).catch(() => null);
         await updateDashboardMessage().catch(() => null);
-        return interaction.reply({ content: "✅ Abmeldung wurde eingetragen.", ephemeral: true });
+        return interaction.reply({ content: "✅ Abmeldung wurde eingereicht und wartet auf Genehmigung.", ephemeral: true });
       }
 
       if (interaction.customId === "food_modal") {
