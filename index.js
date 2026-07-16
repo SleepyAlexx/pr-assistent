@@ -1293,40 +1293,111 @@ function isTrackedEmployeeMember(member) {
   return TRACKED_EMPLOYEE_ROLE_IDS.some((roleId) => member?.roles?.cache?.has(roleId));
 }
 
+function hasTrackedOrManagementRole(member) {
+  return (
+    TRACKED_EMPLOYEE_ROLE_IDS.some((roleId) => member?.roles?.cache?.has(roleId)) ||
+    MANAGEMENT_TEAMUPDATE_ROLE_IDS.some((roleId) => member?.roles?.cache?.has(roleId))
+  );
+}
+
+// WICHTIG:
+// Keine guild.members.fetch() ohne User-ID mehr benutzen.
+// Das löst bei größeren Servern Discord GatewayRateLimitError opcode 8 aus.
+// Zeitlisten/Dashboard arbeiten deshalb datenbankbasiert und nutzen nur Cache bzw. gezielte Einzel-Fetches.
+const memberStatusCache = new Map();
+const MEMBER_STATUS_CACHE_MS = 5 * 60 * 1000;
+let trackedEmployeeSyncRunning = null;
+
+function clearMemberStatusCache(userId = null) {
+  if (userId) memberStatusCache.delete(userId);
+  else memberStatusCache.clear();
+}
+
 async function fetchGuildMembersSafe() {
   const guild = await client.guilds.fetch(GUILD_ID).catch(() => null);
   if (!guild) return { guild: null, members: null };
 
-  const members = await guild.members.fetch().catch((err) => {
-    console.error("❌ Mitglieder konnten nicht für Zeitlisten geladen werden:", err);
-    return null;
-  });
-
-  return { guild, members };
+  // Nur den vorhandenen Cache zurückgeben. Kein kompletter Member-Fetch.
+  return { guild, members: guild.members.cache };
 }
 
-async function syncTrackedEmployeesIntoDatabase() {
-  const { members } = await fetchGuildMembersSafe();
-  if (!members) return { trackedIds: [], members: null };
+async function getMemberStatus(userId, { force = false } = {}) {
+  if (!userId) return null;
 
-  const trackedMembers = [...members.values()].filter(isTrackedEmployeeMember);
-  const trackedIds = trackedMembers.map((member) => member.id);
+  const cached = memberStatusCache.get(userId);
+  if (!force && cached && cached.expiresAt > Date.now()) return cached.status;
 
-  for (const member of trackedMembers) {
+  const guild = client.guilds.cache.get(GUILD_ID) || await client.guilds.fetch(GUILD_ID).catch(() => null);
+  if (!guild) return null;
+
+  let member = guild.members.cache.get(userId) || null;
+
+  // Einzelne Member-Fetches sind okay; problematisch war nur der komplette guild.members.fetch().
+  if (!member) {
+    member = await guild.members.fetch(userId).catch(() => null);
+  }
+
+  const status = member
+    ? {
+        id: member.id,
+        member,
+        isTracked: isTrackedEmployeeMember(member),
+        hasTrackedOrManagement: hasTrackedOrManagementRole(member),
+        hasDutyRole: member.roles.cache.has(DUTY_ROLE_ID),
+        displayName: member.nickname || member.displayName || member.user.globalName || member.user.username,
+      }
+    : {
+        id: userId,
+        member: null,
+        isTracked: false,
+        hasTrackedOrManagement: false,
+        hasDutyRole: false,
+        displayName: null,
+      };
+
+  memberStatusCache.set(userId, { status, expiresAt: Date.now() + MEMBER_STATUS_CACHE_MS });
+  return status;
+}
+
+async function syncKnownTrackedEmployeesFromCache() {
+  const guild = client.guilds.cache.get(GUILD_ID) || await client.guilds.fetch(GUILD_ID).catch(() => null);
+  if (!guild) return;
+
+  // Nur bereits bekannte/cached Mitglieder synchronisieren. Kein Server-weites Laden.
+  for (const member of guild.members.cache.values()) {
+    if (!hasTrackedOrManagementRole(member)) continue;
+
+    await ensureRequiredCompanionRoles(member).catch(() => null);
     await ensureEmployee(member.id).catch(() => null);
     await query(`UPDATE employees SET left_server = FALSE WHERE user_id = $1`, [member.id]).catch(() => null);
+    await autoLinkBusinessNameFromMember(member, "Cache-Rollen-Sync").catch(() => null);
+    clearMemberStatusCache(member.id);
   }
+}
 
-  if (trackedIds.length) {
-    await query(
-      `UPDATE employees SET left_server = TRUE WHERE user_id <> ALL($1::text[])`,
-      [trackedIds]
-    ).catch(() => null);
-  } else {
-    await query(`UPDATE employees SET left_server = TRUE`).catch(() => null);
+async function syncTrackedEmployeesIntoDatabase({ force = false } = {}) {
+  if (trackedEmployeeSyncRunning) return trackedEmployeeSyncRunning;
+
+  trackedEmployeeSyncRunning = (async () => {
+    await syncKnownTrackedEmployeesFromCache().catch(() => null);
+
+    // Nur Datenbank als Quelle für Zeitlisten verwenden, damit kein Gateway-Rate-Limit ausgelöst wird.
+    // Wenn Rollen geändert werden, aktualisiert guildMemberUpdate die DB automatisch.
+    const result = await query(
+      `SELECT user_id FROM employees WHERE left_server = FALSE ORDER BY user_id`
+    ).catch((err) => {
+      console.error("❌ Mitarbeiter-Datenbank konnte nicht für Zeitlisten gelesen werden:", err);
+      return { rows: [] };
+    });
+
+    return { trackedIds: result.rows.map((row) => row.user_id) };
+  })();
+
+  try {
+    return await trackedEmployeeSyncRunning;
+  } finally {
+    trackedEmployeeSyncRunning = null;
   }
-
-  return { trackedIds, members };
 }
 
 async function getTrackedEmployeeTimeRows(columnName) {
@@ -1340,6 +1411,7 @@ async function getTrackedEmployeeTimeRows(columnName) {
       SELECT user_id, ${safeColumn} AS minutes
       FROM employees
       WHERE user_id = ANY($1::text[])
+        AND left_server = FALSE
       ORDER BY ${safeColumn} DESC;
     `,
     [trackedIds]
@@ -1712,50 +1784,36 @@ async function weeklyResetOnly() {
 }
 
 async function syncEmployeeRoles() {
-  const guild = await client.guilds.fetch(GUILD_ID);
-  const members = await guild.members.fetch();
-  const employees = await query(`SELECT user_id FROM employees`);
+  const employees = await query(`SELECT user_id FROM employees`).catch(() => ({ rows: [] }));
 
-  for (const member of members.values()) {
-    const hasEmployeeOrProbe = TRACKED_EMPLOYEE_ROLE_IDS.some((roleId) => member.roles.cache.has(roleId));
-    const hasManagementTeamupdateRole = MANAGEMENT_TEAMUPDATE_ROLE_IDS.some((roleId) => member.roles.cache.has(roleId));
-
-    if (hasEmployeeOrProbe || hasManagementTeamupdateRole) {
-      await ensureRequiredCompanionRoles(member).catch(() => null);
-      await ensureEmployee(member.id);
-      await query(`UPDATE employees SET left_server = FALSE WHERE user_id = $1`, [member.id]);
-      await autoLinkBusinessNameFromMember(member, "Rollen-Sync");
-    }
-  }
-
+  // Keine komplette Memberliste mehr laden. Nur bekannte DB-User werden einzeln geprüft.
   for (const employee of employees.rows) {
-    const member = members.get(employee.user_id);
-    const isTracked = member
-      ? TRACKED_EMPLOYEE_ROLE_IDS.some((roleId) => member.roles.cache.has(roleId))
-      : false;
+    const status = await getMemberStatus(employee.user_id, { force: true }).catch(() => null);
+    const member = status?.member || null;
+    const isTracked = Boolean(status?.isTracked);
 
-    await query(`UPDATE employees SET left_server = $2 WHERE user_id = $1`, [employee.user_id, !isTracked]);
+    await query(`UPDATE employees SET left_server = $2 WHERE user_id = $1`, [employee.user_id, !isTracked]).catch(() => null);
+
+    if (member && status?.hasTrackedOrManagement) {
+      await ensureRequiredCompanionRoles(member).catch(() => null);
+      await autoLinkBusinessNameFromMember(member, "Rollen-Sync").catch(() => null);
+    }
 
     if (!isTracked) {
-      await query(`DELETE FROM active_sessions WHERE user_id = $1`, [employee.user_id]);
+      await query(`DELETE FROM active_sessions WHERE user_id = $1`, [employee.user_id]).catch(() => null);
       if (member) await member.roles.remove(DUTY_ROLE_ID).catch(() => {});
     }
   }
 
-  await updateTotalWorktimeMessage();
-  await updateWeeklyWorktimeMessage();
-  console.log("✅ Mitarbeiter-/Probe-Mitarbeiter-Rollen wurden synchronisiert.");
+  await syncKnownTrackedEmployeesFromCache().catch(() => null);
+  clearMemberStatusCache();
+  console.log("✅ Mitarbeiter-/Probe-Mitarbeiter-Rollen wurden ohne Full-Member-Fetch synchronisiert.");
 }
 
 async function getCleanUserDisplay(userId) {
   try {
-    const guild = await client.guilds.fetch(GUILD_ID);
-    const member = await guild.members.fetch(userId).catch(() => null);
-
-    if (member) {
-      const name = member.nickname || member.user.globalName || member.user.username;
-      return `└ ${name}`;
-    }
+    const status = await getMemberStatus(userId).catch(() => null);
+    if (status?.displayName) return `└ ${status.displayName}`;
 
     const user = await client.users.fetch(userId).catch(() => null);
     if (user) return `└ ${user.globalName || user.username}`;
@@ -2701,15 +2759,14 @@ async function findFoodBusinessUser(icName) {
     return { userId: oldMapped.rows[0].user_id, source: "business_name_links" };
   }
 
-  const guild = await client.guilds.fetch(GUILD_ID).catch(() => null);
+  const guild = client.guilds.cache.get(GUILD_ID) || await client.guilds.fetch(GUILD_ID).catch(() => null);
   if (!guild) return { userId: null, source: "none", matches: [] };
 
-  const members = await guild.members.fetch().catch(() => null);
-  if (!members) return { userId: null, source: "none", matches: [] };
-
+  // Kein kompletter guild.members.fetch() mehr, sonst GatewayRateLimit opcode 8.
+  // Unbekannte Namen werden über die Pending-Auswahl zugeordnet und danach gespeichert.
   const matches = [];
 
-  for (const [, member] of members) {
+  for (const member of guild.members.cache.values()) {
     const display = member.nickname || member.user.globalName || member.user.username;
     const cleanDisplay = stripDiscordPrefix(display);
     const normalizedDisplay = normalizeFoodBusinessName(cleanDisplay);
@@ -2726,7 +2783,7 @@ async function findFoodBusinessUser(icName) {
   }
 
   if (matches.length === 1) {
-    return { userId: matches[0].id, source: "nickname", matches };
+    return { userId: matches[0].id, source: "nickname_cache", matches };
   }
 
   return { userId: null, source: matches.length > 1 ? "multiple" : "none", matches };
@@ -3252,22 +3309,25 @@ function dutyResetButtons(resetId) {
 }
 
 async function getDutyResetPreviewData() {
-  const { guild } = await fetchGuildMembersSafe();
-  let membersWithDutyRole = [];
+  const activeSessions = await query(`SELECT user_id FROM active_sessions ORDER BY started_at ASC`).catch(() => ({ rows: [] }));
+  const employees = await query(`SELECT user_id FROM employees WHERE left_server = FALSE`).catch(() => ({ rows: [] }));
 
-  if (guild) {
-    const members = await guild.members.fetch().catch(() => null);
-    if (members) {
-      membersWithDutyRole = [...members.values()].filter((member) => member.roles.cache.has(DUTY_ROLE_ID));
-    }
+  const candidateIds = [...new Set([
+    ...activeSessions.rows.map((row) => row.user_id),
+    ...employees.rows.map((row) => row.user_id),
+  ])];
+
+  const dutyRoleUserIds = [];
+
+  for (const userId of candidateIds) {
+    const status = await getMemberStatus(userId, { force: true }).catch(() => null);
+    if (status?.hasDutyRole) dutyRoleUserIds.push(userId);
   }
 
-  const activeSessions = await query(`SELECT user_id FROM active_sessions ORDER BY started_at ASC`).catch(() => ({ rows: [] }));
-
   return {
-    dutyRoleCount: membersWithDutyRole.length,
+    dutyRoleCount: dutyRoleUserIds.length,
     activeSessionCount: activeSessions.rows.length,
-    dutyRoleUserIds: membersWithDutyRole.map((member) => member.id),
+    dutyRoleUserIds,
     activeSessionUserIds: activeSessions.rows.map((row) => row.user_id),
   };
 }
@@ -3297,24 +3357,25 @@ function buildDutyResetPreviewEmbed(data) {
 }
 
 async function performDutyReset(issuerTag = "Unbekannt") {
-  const guild = await client.guilds.fetch(GUILD_ID).catch(() => null);
+  const preview = await getDutyResetPreviewData();
+  const affectedIds = [...new Set([...(preview.dutyRoleUserIds || []), ...(preview.activeSessionUserIds || [])])];
+
   let removed = 0;
   let failed = 0;
 
-  if (guild) {
-    const members = await guild.members.fetch().catch(() => null);
-    if (members) {
-      const membersWithDutyRole = [...members.values()].filter((member) => member.roles.cache.has(DUTY_ROLE_ID));
+  for (const userId of affectedIds) {
+    const status = await getMemberStatus(userId, { force: true }).catch(() => null);
+    const member = status?.member || null;
 
-      for (const member of membersWithDutyRole) {
-        try {
-          await member.roles.remove(DUTY_ROLE_ID, `Notfall-Dienst-Reset durch ${issuerTag}`);
-          removed++;
-        } catch (err) {
-          failed++;
-          console.error(`❌ Im-Dienst-Rolle konnte bei ${member.id} nicht entfernt werden:`, err);
-        }
-      }
+    if (!member || !member.roles.cache.has(DUTY_ROLE_ID)) continue;
+
+    try {
+      await member.roles.remove(DUTY_ROLE_ID, `Notfall-Dienst-Reset durch ${issuerTag}`);
+      removed++;
+      clearMemberStatusCache(userId);
+    } catch (err) {
+      failed++;
+      console.error(`❌ Im-Dienst-Rolle konnte bei ${userId} nicht entfernt werden:`, err);
     }
   }
 
@@ -3473,12 +3534,14 @@ setTimeout(() => {
 }, 5000);
 
 client.on("guildMemberRemove", async (member) => {
+  clearMemberStatusCache(member.id);
   await deleteEmployeeTimeData(member.id).catch((err) => console.error("❌ Member-Leave Zeitdaten löschen fehlgeschlagen:", err));
   await updateTotalWorktimeMessage().catch(() => null);
   await updateWeeklyWorktimeMessage().catch(() => null);
 });
 
 client.on("guildMemberAdd", async (member) => {
+  clearMemberStatusCache(member.id);
   const channel = await client.channels.fetch(WELCOME_CHANNEL_ID).catch(() => null);
   if (!channel) return;
 
@@ -3490,6 +3553,7 @@ client.on("guildMemberAdd", async (member) => {
 });
 
 client.on("guildMemberUpdate", async (oldMember, newMember) => {
+  clearMemberStatusCache(newMember.id);
   const hadEmployeeRole = oldMember.roles.cache.has(EMPLOYEE_ROLE_ID);
   const hasEmployeeRole = newMember.roles.cache.has(EMPLOYEE_ROLE_ID);
 
