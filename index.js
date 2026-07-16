@@ -1273,17 +1273,24 @@ async function sendOrUpdatePermanentMessage(channelId, key, payload) {
   await setSetting(key, msg.id);
 }
 
-async function getOnlineUsersMap() {
-  const active = await query(`SELECT user_id FROM active_sessions`);
-  const map = {
-        time_add_user: "time_add",
-        time_remove_user: "time_remove",
-        time_set_weekly_user: "time_set_weekly",
-        time_set_total_user: "time_set_total",
-        time_view_user: "time_view",};
+async function getOnlineUsersMap({ cleanupStale = true } = {}) {
+  const active = await query(`SELECT user_id FROM active_sessions ORDER BY started_at ASC`).catch(() => ({ rows: [] }));
+  const map = {};
 
   for (const row of active.rows) {
-    map[row.user_id] = true;
+    const status = await getMemberStatus(row.user_id).catch(() => null);
+
+    // Nur echte Mitarbeiter/Probe-Mitarbeiter mit aktiver Im-Dienst-Rolle gelten als eingestempelt.
+    if (status?.isTracked && status?.hasDutyRole) {
+      map[row.user_id] = true;
+      continue;
+    }
+
+    // Stale Sessions aus der DB entfernen, damit Dashboard/Leaderboards nicht alte Dienste anzeigen.
+    if (cleanupStale && (!status?.member || !status?.isTracked || !status?.hasDutyRole)) {
+      await query(`DELETE FROM active_sessions WHERE user_id = $1`, [row.user_id]).catch(() => null);
+      await query(`DELETE FROM foodbusiness_forgot_alerts WHERE user_id = $1`, [row.user_id]).catch(() => null);
+    }
   }
 
   return map;
@@ -1300,17 +1307,30 @@ function hasTrackedOrManagementRole(member) {
   );
 }
 
+function escapeMarkdownBasic(value) {
+  return String(value || "")
+    .replace(/[\*_`~>|]/g, "\$&")
+    .slice(0, 80);
+}
+
 // WICHTIG:
 // Keine guild.members.fetch() ohne User-ID mehr benutzen.
 // Das löst bei größeren Servern Discord GatewayRateLimitError opcode 8 aus.
-// Zeitlisten/Dashboard arbeiten deshalb datenbankbasiert und nutzen nur Cache bzw. gezielte Einzel-Fetches.
+// Zeitlisten/Dashboard prüfen nur gezielt einzelne bekannte DB-User und cachen das Ergebnis.
 const memberStatusCache = new Map();
 const MEMBER_STATUS_CACHE_MS = 5 * 60 * 1000;
+const TRACKED_IDS_CACHE_MS = 3 * 60 * 1000;
 let trackedEmployeeSyncRunning = null;
+let trackedIdsCache = { ids: [], expiresAt: 0 };
+
+function clearTrackedEmployeeIdsCache() {
+  trackedIdsCache = { ids: [], expiresAt: 0 };
+}
 
 function clearMemberStatusCache(userId = null) {
   if (userId) memberStatusCache.delete(userId);
   else memberStatusCache.clear();
+  clearTrackedEmployeeIdsCache();
 }
 
 async function fetchGuildMembersSafe() {
@@ -1371,8 +1391,43 @@ async function syncKnownTrackedEmployeesFromCache() {
     await ensureEmployee(member.id).catch(() => null);
     await query(`UPDATE employees SET left_server = FALSE WHERE user_id = $1`, [member.id]).catch(() => null);
     await autoLinkBusinessNameFromMember(member, "Cache-Rollen-Sync").catch(() => null);
-    clearMemberStatusCache(member.id);
+    memberStatusCache.delete(member.id);
   }
+}
+
+async function getVerifiedTrackedEmployeeIds({ force = false } = {}) {
+  if (!force && trackedIdsCache.expiresAt > Date.now()) return trackedIdsCache.ids;
+
+  const result = await query(
+    `SELECT user_id FROM employees WHERE left_server = FALSE ORDER BY user_id`
+  ).catch((err) => {
+    console.error("❌ Mitarbeiter-Datenbank konnte nicht für Zeitlisten gelesen werden:", err);
+    return { rows: [] };
+  });
+
+  const verifiedIds = [];
+
+  for (const row of result.rows) {
+    const status = await getMemberStatus(row.user_id).catch(() => null);
+
+    if (status?.isTracked) {
+      verifiedIds.push(row.user_id);
+      continue;
+    }
+
+    // Entfernt alte DB-Leichen aus den sichtbaren Zeitlisten.
+    await query(`UPDATE employees SET left_server = TRUE WHERE user_id = $1`, [row.user_id]).catch(() => null);
+    await query(`DELETE FROM active_sessions WHERE user_id = $1`, [row.user_id]).catch(() => null);
+    await query(`DELETE FROM foodbusiness_forgot_alerts WHERE user_id = $1`, [row.user_id]).catch(() => null);
+
+    if (status?.member?.roles?.cache?.has(DUTY_ROLE_ID)) {
+      await status.member.roles.remove(DUTY_ROLE_ID, "Zeitlisten-Bereinigung: keine Mitarbeiter-/Probe-Mitarbeiter-Rolle").catch(() => null);
+      memberStatusCache.delete(row.user_id);
+    }
+  }
+
+  trackedIdsCache = { ids: verifiedIds, expiresAt: Date.now() + TRACKED_IDS_CACHE_MS };
+  return verifiedIds;
 }
 
 async function syncTrackedEmployeesIntoDatabase({ force = false } = {}) {
@@ -1380,17 +1435,8 @@ async function syncTrackedEmployeesIntoDatabase({ force = false } = {}) {
 
   trackedEmployeeSyncRunning = (async () => {
     await syncKnownTrackedEmployeesFromCache().catch(() => null);
-
-    // Nur Datenbank als Quelle für Zeitlisten verwenden, damit kein Gateway-Rate-Limit ausgelöst wird.
-    // Wenn Rollen geändert werden, aktualisiert guildMemberUpdate die DB automatisch.
-    const result = await query(
-      `SELECT user_id FROM employees WHERE left_server = FALSE ORDER BY user_id`
-    ).catch((err) => {
-      console.error("❌ Mitarbeiter-Datenbank konnte nicht für Zeitlisten gelesen werden:", err);
-      return { rows: [] };
-    });
-
-    return { trackedIds: result.rows.map((row) => row.user_id) };
+    const trackedIds = await getVerifiedTrackedEmployeeIds({ force });
+    return { trackedIds };
   })();
 
   try {
@@ -1424,15 +1470,45 @@ async function getTrackedEmployeeTimeRows(columnName) {
 }
 
 async function getTrackedActiveSessionRows() {
-  const { trackedIds } = await syncTrackedEmployeesIntoDatabase();
-  if (!trackedIds.length) return [];
+  const active = await query(`SELECT user_id FROM active_sessions ORDER BY started_at ASC`).catch(() => ({ rows: [] }));
+  const rows = [];
 
-  const result = await query(
-    `SELECT user_id FROM active_sessions WHERE user_id = ANY($1::text[]) ORDER BY started_at ASC`,
-    [trackedIds]
-  ).catch(() => ({ rows: [] }));
+  for (const row of active.rows) {
+    const status = await getMemberStatus(row.user_id).catch(() => null);
 
-  return result.rows;
+    if (status?.isTracked && status?.hasDutyRole) {
+      rows.push(row);
+      continue;
+    }
+
+    // Stale Sessions entfernen, damit nicht plötzlich 20 Leute als eingestempelt angezeigt werden.
+    await query(`DELETE FROM active_sessions WHERE user_id = $1`, [row.user_id]).catch(() => null);
+    await query(`DELETE FROM foodbusiness_forgot_alerts WHERE user_id = $1`, [row.user_id]).catch(() => null);
+
+    if (status?.member && status.hasDutyRole && !status.isTracked) {
+      await status.member.roles.remove(DUTY_ROLE_ID, "Dienstbereinigung: keine Mitarbeiter-/Probe-Mitarbeiter-Rolle").catch(() => null);
+      memberStatusCache.delete(row.user_id);
+    }
+  }
+
+  return rows;
+}
+
+async function getLeaderboardUserLabel(userId) {
+  const status = await getMemberStatus(userId).catch(() => null);
+  if (status?.displayName) return `**${escapeMarkdownBasic(status.displayName)}**`;
+
+  const user = await client.users.fetch(userId).catch(() => null);
+  if (user) return `**${escapeMarkdownBasic(user.globalName || user.username)}**`;
+
+  return `\`${userId}\``;
+}
+
+async function formatLeaderboardLine(row, realIndex, onlineMap) {
+  const label = await getLeaderboardUserLabel(row.user_id);
+  const dot = onlineMap[row.user_id] ? "🟢 " : "";
+  return `${medal(realIndex)} ${dot}${label}
+└ 🕒 **${formatMinutes(Number(row.minutes || 0))}**`;
 }
 
 async function updateTotalWorktimeMessage() {
@@ -1451,13 +1527,9 @@ async function updateTotalWorktimeMessage() {
   const pageRows = rows.slice(start, start + LEADERBOARD_PAGE_SIZE);
 
   const description = pageRows.length
-    ? pageRows
-        .map((r, i) => {
-          const realIndex = start + i;
-          const dot = onlineMap[r.user_id] ? "🟢 " : "";
-          return `${medal(realIndex)} ${dot}<@${r.user_id}>\n└ 🕒 **${formatMinutes(r.minutes)}**`;
-        })
-        .join("\n\n")
+    ? (await Promise.all(
+        pageRows.map((r, i) => formatLeaderboardLine(r, start + i, onlineMap))
+      )).join("\n\n")
     : "Noch keine Zeiten vorhanden.";
 
   const embed = new EmbedBuilder()
@@ -1489,13 +1561,9 @@ async function updateWeeklyWorktimeMessage() {
   const pageRows = rows.slice(start, start + LEADERBOARD_PAGE_SIZE);
 
   const description = pageRows.length
-    ? pageRows
-        .map((r, i) => {
-          const realIndex = start + i;
-          const dot = onlineMap[r.user_id] ? "🟢 " : "";
-          return `${medal(realIndex)} ${dot}<@${r.user_id}>\n└ 🕒 **${formatMinutes(r.minutes)}**`;
-        })
-        .join("\n\n")
+    ? (await Promise.all(
+        pageRows.map((r, i) => formatLeaderboardLine(r, start + i, onlineMap))
+      )).join("\n\n")
     : "Noch keine Zeiten vorhanden.";
 
   const embed = new EmbedBuilder()
@@ -3311,10 +3379,13 @@ function dutyResetButtons(resetId) {
 async function getDutyResetPreviewData() {
   const activeSessions = await query(`SELECT user_id FROM active_sessions ORDER BY started_at ASC`).catch(() => ({ rows: [] }));
   const employees = await query(`SELECT user_id FROM employees WHERE left_server = FALSE`).catch(() => ({ rows: [] }));
+  const guild = client.guilds.cache.get(GUILD_ID) || await client.guilds.fetch(GUILD_ID).catch(() => null);
+  const cachedDutyRoleUserIds = guild?.roles?.cache?.get(DUTY_ROLE_ID)?.members?.map((member) => member.id) || [];
 
   const candidateIds = [...new Set([
     ...activeSessions.rows.map((row) => row.user_id),
     ...employees.rows.map((row) => row.user_id),
+    ...cachedDutyRoleUserIds,
   ])];
 
   const dutyRoleUserIds = [];
