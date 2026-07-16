@@ -166,6 +166,7 @@ const client = new Client({
 const managementDrafts = new Map();
 const timeManagementDrafts = new Map();
 const serviceCorrectionDrafts = new Map();
+const dutyResetDrafts = new Map();
 
 
 function draftKey(userId, type) {
@@ -665,6 +666,10 @@ async function registerCommands() {
           .setDescription("Grund, z. B. Crash")
           .setRequired(true)
       ),
+
+    new SlashCommandBuilder()
+      .setName("dienst-reset")
+      .setDescription("Notfall-Reset: entfernt Im-Dienst-Rollen und leert aktive Sessions ohne Zeitbuchung."),
   ].map((cmd) => cmd.toJSON());
 
   async function withTimeout(promise, ms, label) {
@@ -839,7 +844,11 @@ function managementPanelRows() {
     new ButtonBuilder().setCustomId("mgmt_time_start").setLabel("Zeitverwaltung").setEmoji("⏱️").setStyle(ButtonStyle.Secondary)
   );
 
-  return [row1, row2];
+  const row3 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("mgmt_duty_reset_start").setLabel("Dienst-Reset").setEmoji("🧹").setStyle(ButtonStyle.Danger)
+  );
+
+  return [row1, row2, row3];
 }
 
 function timeManagementPanelRows() {
@@ -1280,38 +1289,86 @@ async function getOnlineUsersMap() {
   return map;
 }
 
-async function getTrackedEmployeeIds() {
-  const guild = await client.guilds.fetch(GUILD_ID).catch(() => null);
-  if (!guild) return [];
-
-  const members = await guild.members.fetch().catch(() => null);
-  if (!members) return [];
-
-  return [...members.values()]
-    .filter((member) => TRACKED_EMPLOYEE_ROLE_IDS.some((roleId) => member.roles.cache.has(roleId)))
-    .map((member) => member.id);
+function isTrackedEmployeeMember(member) {
+  return TRACKED_EMPLOYEE_ROLE_IDS.some((roleId) => member?.roles?.cache?.has(roleId));
 }
 
-function asQueryRows(rows = []) {
-  return { rows };
+async function fetchGuildMembersSafe() {
+  const guild = await client.guilds.fetch(GUILD_ID).catch(() => null);
+  if (!guild) return { guild: null, members: null };
+
+  const members = await guild.members.fetch().catch((err) => {
+    console.error("❌ Mitglieder konnten nicht für Zeitlisten geladen werden:", err);
+    return null;
+  });
+
+  return { guild, members };
+}
+
+async function syncTrackedEmployeesIntoDatabase() {
+  const { members } = await fetchGuildMembersSafe();
+  if (!members) return { trackedIds: [], members: null };
+
+  const trackedMembers = [...members.values()].filter(isTrackedEmployeeMember);
+  const trackedIds = trackedMembers.map((member) => member.id);
+
+  for (const member of trackedMembers) {
+    await ensureEmployee(member.id).catch(() => null);
+    await query(`UPDATE employees SET left_server = FALSE WHERE user_id = $1`, [member.id]).catch(() => null);
+  }
+
+  if (trackedIds.length) {
+    await query(
+      `UPDATE employees SET left_server = TRUE WHERE user_id <> ALL($1::text[])`,
+      [trackedIds]
+    ).catch(() => null);
+  } else {
+    await query(`UPDATE employees SET left_server = TRUE`).catch(() => null);
+  }
+
+  return { trackedIds, members };
+}
+
+async function getTrackedEmployeeTimeRows(columnName) {
+  const { trackedIds } = await syncTrackedEmployeesIntoDatabase();
+  const safeColumn = columnName === "weekly_minutes" ? "weekly_minutes" : "total_minutes";
+
+  if (!trackedIds.length) return [];
+
+  const result = await query(
+    `
+      SELECT user_id, ${safeColumn} AS minutes
+      FROM employees
+      WHERE user_id = ANY($1::text[])
+      ORDER BY ${safeColumn} DESC;
+    `,
+    [trackedIds]
+  ).catch((err) => {
+    console.error(`❌ Zeitliste konnte nicht geladen werden (${safeColumn}):`, err);
+    return { rows: [] };
+  });
+
+  return result.rows;
+}
+
+async function getTrackedActiveSessionRows() {
+  const { trackedIds } = await syncTrackedEmployeesIntoDatabase();
+  if (!trackedIds.length) return [];
+
+  const result = await query(
+    `SELECT user_id FROM active_sessions WHERE user_id = ANY($1::text[]) ORDER BY started_at ASC`,
+    [trackedIds]
+  ).catch(() => ({ rows: [] }));
+
+  return result.rows;
 }
 
 async function updateTotalWorktimeMessage() {
-  const trackedIds = await getTrackedEmployeeIds();
-  const result = trackedIds.length
-    ? await query(`
-        SELECT user_id, total_minutes AS minutes
-        FROM employees
-        WHERE left_server = FALSE
-          AND user_id = ANY($1::text[])
-        ORDER BY total_minutes DESC;
-      `, [trackedIds])
-    : asQueryRows([]);
-
+  const rows = await getTrackedEmployeeTimeRows("total_minutes");
   const onlineMap = await getOnlineUsersMap();
 
   let page = Number(await getSetting("total_page", "0"));
-  const totalPages = Math.max(1, Math.ceil(result.rows.length / LEADERBOARD_PAGE_SIZE));
+  const totalPages = Math.max(1, Math.ceil(rows.length / LEADERBOARD_PAGE_SIZE));
 
   if (page >= totalPages) page = totalPages - 1;
   if (page < 0) page = 0;
@@ -1319,7 +1376,7 @@ async function updateTotalWorktimeMessage() {
   await setSetting("total_page", page);
 
   const start = page * LEADERBOARD_PAGE_SIZE;
-  const pageRows = result.rows.slice(start, start + LEADERBOARD_PAGE_SIZE);
+  const pageRows = rows.slice(start, start + LEADERBOARD_PAGE_SIZE);
 
   const description = pageRows.length
     ? pageRows
@@ -1345,21 +1402,11 @@ async function updateTotalWorktimeMessage() {
 }
 
 async function updateWeeklyWorktimeMessage() {
-  const trackedIds = await getTrackedEmployeeIds();
-  const result = trackedIds.length
-    ? await query(`
-        SELECT user_id, weekly_minutes AS minutes
-        FROM employees
-        WHERE left_server = FALSE
-          AND user_id = ANY($1::text[])
-        ORDER BY weekly_minutes DESC;
-      `, [trackedIds])
-    : asQueryRows([]);
-
+  const rows = await getTrackedEmployeeTimeRows("weekly_minutes");
   const onlineMap = await getOnlineUsersMap();
 
   let page = Number(await getSetting("weekly_page", "0"));
-  const totalPages = Math.max(1, Math.ceil(result.rows.length / LEADERBOARD_PAGE_SIZE));
+  const totalPages = Math.max(1, Math.ceil(rows.length / LEADERBOARD_PAGE_SIZE));
 
   if (page >= totalPages) page = totalPages - 1;
   if (page < 0) page = 0;
@@ -1367,7 +1414,7 @@ async function updateWeeklyWorktimeMessage() {
   await setSetting("weekly_page", page);
 
   const start = page * LEADERBOARD_PAGE_SIZE;
-  const pageRows = result.rows.slice(start, start + LEADERBOARD_PAGE_SIZE);
+  const pageRows = rows.slice(start, start + LEADERBOARD_PAGE_SIZE);
 
   const description = pageRows.length
     ? pageRows
@@ -1720,10 +1767,9 @@ async function getCleanUserDisplay(userId) {
 }
 
 async function updateDashboardMessage() {
-  const trackedIds = await getTrackedEmployeeIds();
-  const activeSessions = trackedIds.length
-    ? await query(`SELECT user_id FROM active_sessions WHERE user_id = ANY($1::text[])`, [trackedIds])
-    : asQueryRows([]);
+  const { trackedIds } = await syncTrackedEmployeesIntoDatabase();
+  const activeSessionRows = await getTrackedActiveSessionRows();
+  const activeSessions = { rows: activeSessionRows };
   const activeWarnings = await query(`SELECT COUNT(*)::int AS count FROM warning_records WHERE active = TRUE`);
   const oldWarnings = await query(`
     SELECT COUNT(*)::int AS count
@@ -1736,10 +1782,9 @@ async function updateDashboardMessage() {
     ? await query(`
         SELECT COUNT(*)::int AS count, COALESCE(AVG(weekly_minutes), 0)::int AS avg_weekly
         FROM employees
-        WHERE left_server = FALSE
-          AND user_id = ANY($1::text[])
+        WHERE user_id = ANY($1::text[])
       `, [trackedIds])
-    : asQueryRows([{ count: 0, avg_weekly: 0 }]);
+    : { rows: [{ count: 0, avg_weekly: 0 }] };
   const weekAbsences = await query(`
     SELECT COUNT(*)::int AS count
     FROM absences
@@ -2075,42 +2120,39 @@ async function buildEmployeeCheckEmbed(userId) {
 }
 
 async function updateWeeklyStatisticsMessage() {
-  const trackedIds = await getTrackedEmployeeIds();
+  const { trackedIds } = await syncTrackedEmployeesIntoDatabase();
 
   const topWeekly = trackedIds.length
     ? await query(`
         SELECT user_id, weekly_minutes
         FROM employees
-        WHERE left_server = FALSE
-          AND user_id = ANY($1::text[])
+        WHERE user_id = ANY($1::text[])
         ORDER BY weekly_minutes DESC
         LIMIT 5
       `, [trackedIds])
-    : asQueryRows([]);
+    : { rows: [] };
 
   const topTotal = trackedIds.length
     ? await query(`
         SELECT user_id, total_minutes
         FROM employees
-        WHERE left_server = FALSE
-          AND user_id = ANY($1::text[])
+        WHERE user_id = ANY($1::text[])
         ORDER BY total_minutes DESC
         LIMIT 5
       `, [trackedIds])
-    : asQueryRows([]);
+    : { rows: [] };
 
   const activeWarnings = await query(`SELECT COUNT(*)::int AS count FROM warning_records WHERE active = TRUE`);
   const activeSessions = trackedIds.length
     ? await query(`SELECT COUNT(*)::int AS count FROM active_sessions WHERE user_id = ANY($1::text[])`, [trackedIds])
-    : asQueryRows([{ count: 0 }]);
+    : { rows: [{ count: 0 }] };
   const employeeStats = trackedIds.length
     ? await query(`
         SELECT COUNT(*)::int AS count, COALESCE(AVG(weekly_minutes), 0)::int AS avg_weekly
         FROM employees
-        WHERE left_server = FALSE
-          AND user_id = ANY($1::text[])
+        WHERE user_id = ANY($1::text[])
       `, [trackedIds])
-    : asQueryRows([{ count: 0, avg_weekly: 0 }]);
+    : { rows: [{ count: 0, avg_weekly: 0 }] };
   const absences = await query(`
     SELECT COUNT(*)::int AS count
     FROM absences
@@ -3194,6 +3236,112 @@ function dienstCorrectionButtons(correctionId) {
   );
 }
 
+function dutyResetButtons(resetId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`duty_reset_confirm_${resetId}`)
+      .setLabel("Dienst-Reset durchführen")
+      .setEmoji("🧹")
+      .setStyle(ButtonStyle.Danger),
+    new ButtonBuilder()
+      .setCustomId(`duty_reset_cancel_${resetId}`)
+      .setLabel("Abbrechen")
+      .setEmoji("❌")
+      .setStyle(ButtonStyle.Secondary)
+  );
+}
+
+async function getDutyResetPreviewData() {
+  const { guild } = await fetchGuildMembersSafe();
+  let membersWithDutyRole = [];
+
+  if (guild) {
+    const members = await guild.members.fetch().catch(() => null);
+    if (members) {
+      membersWithDutyRole = [...members.values()].filter((member) => member.roles.cache.has(DUTY_ROLE_ID));
+    }
+  }
+
+  const activeSessions = await query(`SELECT user_id FROM active_sessions ORDER BY started_at ASC`).catch(() => ({ rows: [] }));
+
+  return {
+    dutyRoleCount: membersWithDutyRole.length,
+    activeSessionCount: activeSessions.rows.length,
+    dutyRoleUserIds: membersWithDutyRole.map((member) => member.id),
+    activeSessionUserIds: activeSessions.rows.map((row) => row.user_id),
+  };
+}
+
+function buildDutyResetPreviewEmbed(data) {
+  const affected = [...new Set([...(data.dutyRoleUserIds || []), ...(data.activeSessionUserIds || [])])];
+  const affectedText = affected.length
+    ? affected.slice(0, 15).map((id) => `└ <@${id}>`).join("\n") + (affected.length > 15 ? `\n└ … und ${affected.length - 15} weitere` : "")
+    : "└ Niemand gefunden.";
+
+  return new EmbedBuilder()
+    .setColor(0xe74c3c)
+    .setTitle("🧹 ・DIENST-RESET PRÜFEN")
+    .setDescription(
+      "━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+      "Dieser Notfall-Reset entfernt die **Im-Dienst-Rolle** und löscht aktive Sessions.\n" +
+      "Es wird **keine Zeit gebucht** und nichts zu den Leaderboards addiert.\n" +
+      "━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+    .addFields(
+      { name: "🛡️ Im-Dienst-Rollen", value: `└ ${data.dutyRoleCount || 0}`, inline: true },
+      { name: "🗄️ Aktive Sessions", value: `└ ${data.activeSessionCount || 0}`, inline: true },
+      { name: "👥 Betroffene Personen", value: affectedText }
+    )
+    .setFooter({ text: "Pearls • Notfall-Dienst-Reset" })
+    .setTimestamp();
+}
+
+async function performDutyReset(issuerTag = "Unbekannt") {
+  const guild = await client.guilds.fetch(GUILD_ID).catch(() => null);
+  let removed = 0;
+  let failed = 0;
+
+  if (guild) {
+    const members = await guild.members.fetch().catch(() => null);
+    if (members) {
+      const membersWithDutyRole = [...members.values()].filter((member) => member.roles.cache.has(DUTY_ROLE_ID));
+
+      for (const member of membersWithDutyRole) {
+        try {
+          await member.roles.remove(DUTY_ROLE_ID, `Notfall-Dienst-Reset durch ${issuerTag}`);
+          removed++;
+        } catch (err) {
+          failed++;
+          console.error(`❌ Im-Dienst-Rolle konnte bei ${member.id} nicht entfernt werden:`, err);
+        }
+      }
+    }
+  }
+
+  const deletedSessions = await query(`DELETE FROM active_sessions RETURNING user_id`).catch(() => ({ rows: [] }));
+  await query(`DELETE FROM foodbusiness_forgot_alerts`).catch(() => null);
+
+  await refreshAllTimeDisplays().catch(() => null);
+
+  return { removed, failed, deletedSessions: deletedSessions.rows.length };
+}
+
+function buildDutyResetResultEmbed(result) {
+  return new EmbedBuilder()
+    .setColor(result.failed === 0 ? 0x2ecc71 : 0xe67e22)
+    .setTitle("✅ ・DIENST-RESET ABGESCHLOSSEN")
+    .setDescription(
+      "━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+      `🛡️ **Im-Dienst-Rollen entfernt**\n└ ${result.removed}\n\n` +
+      `🗄️ **Aktive Sessions gelöscht**\n└ ${result.deletedSessions}\n\n` +
+      `⚠️ **Fehlgeschlagene Rollenentfernungen**\n└ ${result.failed}\n\n` +
+      "Es wurde keine Arbeitszeit gebucht. Neue Zeiten werden wieder automatisch über Foodbusiness erkannt.\n" +
+      "━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+    .setFooter({ text: "Pearls • Notfall-Dienst-Reset" })
+    .setTimestamp();
+}
+
 async function applyDienstCorrection(draft) {
   const active = await query(`SELECT * FROM active_sessions WHERE user_id = $1`, [draft.targetUserId]);
   const session = active.rows[0];
@@ -3471,7 +3619,9 @@ client.on("interactionCreate", async (interaction) => {
               "✅ **Verwarnung zurückziehen**\n" +
               "└ Aktive Verwarnung entfernen\n\n" +
               "⏱️ **Zeitverwaltung**\n" +
-              "└ Zeiten ansehen und korrigieren\n" +
+              "└ Zeiten ansehen und korrigieren\n\n" +
+              "🧹 **Dienst-Reset**\n" +
+              "└ Im-Dienst-Rollen im Notfall entfernen, ohne Zeit zu buchen\n" +
               "━━━━━━━━━━━━━━━━━━━━━━━━"
           )
           .setFooter({ text: "Pearls • Managementsystem • Premium Design" })
@@ -3650,6 +3800,22 @@ client.on("interactionCreate", async (interaction) => {
           .setTimestamp();
 
         return interaction.reply({ embeds: [embed], components: [dienstCorrectionButtons(correctionId)], ephemeral: true });
+      }
+
+      if (interaction.commandName === "dienst-reset") {
+        if (!canManagePersonal(interaction.member)) {
+          return interaction.reply({ content: "❌ Du darfst den Dienst-Reset nicht ausführen.", ephemeral: true });
+        }
+
+        const data = await getDutyResetPreviewData();
+        const resetId = `${interaction.user.id}_${Date.now()}`;
+        dutyResetDrafts.set(resetId, { issuerId: interaction.user.id });
+
+        return interaction.reply({
+          embeds: [buildDutyResetPreviewEmbed(data)],
+          components: [dutyResetButtons(resetId)],
+          ephemeral: true,
+        });
       }
 
       if (interaction.commandName === "dashboard") {
@@ -3974,6 +4140,22 @@ client.on("interactionCreate", async (interaction) => {
         });
       }
 
+      if (interaction.customId === "mgmt_duty_reset_start") {
+        if (!canManagePersonal(interaction.member)) {
+          return interaction.reply({ content: "❌ Du darfst den Dienst-Reset nicht nutzen.", ephemeral: true });
+        }
+
+        const data = await getDutyResetPreviewData();
+        const resetId = `${interaction.user.id}_${Date.now()}`;
+        dutyResetDrafts.set(resetId, { issuerId: interaction.user.id });
+
+        return interaction.reply({
+          embeds: [buildDutyResetPreviewEmbed(data)],
+          components: [dutyResetButtons(resetId)],
+          ephemeral: true,
+        });
+      }
+
       if (interaction.customId.startsWith("absence_approve_") || interaction.customId.startsWith("absence_deny_")) {
         if (!canReviewAbsence(interaction.member)) {
           return interaction.reply({
@@ -4072,6 +4254,34 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.update({
           content: `✅ Dienst-Korrektur wurde gebucht. Gespeicherte Arbeitszeit: **${formatShortMinutes(result.minutes)}**`,
           embeds: [],
+          components: [],
+        });
+      }
+
+      if (interaction.customId.startsWith("duty_reset_confirm_") || interaction.customId.startsWith("duty_reset_cancel_")) {
+        const isConfirm = interaction.customId.startsWith("duty_reset_confirm_");
+        const resetId = interaction.customId.replace(isConfirm ? "duty_reset_confirm_" : "duty_reset_cancel_", "");
+        const draft = dutyResetDrafts.get(resetId);
+
+        if (!draft) {
+          return interaction.reply({ content: "❌ Dieser Dienst-Reset ist nicht mehr verfügbar. Bitte neu starten.", ephemeral: true });
+        }
+
+        if (interaction.user.id !== draft.issuerId && !canManagePersonal(interaction.member)) {
+          return interaction.reply({ content: "❌ Du darfst diesen Dienst-Reset nicht bestätigen.", ephemeral: true });
+        }
+
+        if (!isConfirm) {
+          dutyResetDrafts.delete(resetId);
+          return interaction.update({ content: "❌ Dienst-Reset wurde abgebrochen. Es wurde nichts verändert.", embeds: [], components: [] });
+        }
+
+        await interaction.deferUpdate();
+        const result = await performDutyReset(interaction.user.tag || interaction.user.id);
+        dutyResetDrafts.delete(resetId);
+
+        return interaction.editReply({
+          embeds: [buildDutyResetResultEmbed(result)],
           components: [],
         });
       }
