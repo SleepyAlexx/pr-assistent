@@ -95,6 +95,19 @@ const STOCK_CHECK_REMINDER_CHANNEL_ID = "1512314181259366549";
 const BUSINESS_TIME_LOG_CHANNEL_ID = "1512314180752117934";
 const MONEY_LOG_CHANNEL_ID = "1512314180752117935";
 
+// IC-Foodbusiness-Automatik wie beim CC/Tiki-System
+const FOODBUSINESS_TIMELOG_CHANNEL_ID = BUSINESS_TIME_LOG_CHANNEL_ID;
+const FOODBUSINESS_MONEY_LOG_CHANNEL_ID = MONEY_LOG_CHANNEL_ID;
+const FOODBIZ_FORGOT_CHECK_AFTER_MS = 6 * 60 * 60 * 1000;
+const FOODBIZ_MONEY_IDLE_MS = 60 * 60 * 1000;
+const FOODBUSINESS_ERROR_PING_ROLE_IDS = [
+  OWNER_ROLE_ID,
+  CO_OWNER_ROLE_ID,
+  PERSONAL_MANAGER_ROLE_ID,
+  MANAGER_ROLE_ID,
+  ...FULL_ACCESS_ROLE_IDS,
+];
+
 
 const BOOKING_REQUEST_CHANNEL_ID = "1512409329771221075";
 const BOOKING_CONFIRMED_CHANNEL_ID = "1512409661029224488";
@@ -479,6 +492,56 @@ async function initDatabase() {
     );
   `);
 
+  await query(`
+    CREATE TABLE IF NOT EXISTS foodbusiness_name_mappings (
+      normalized_name TEXT PRIMARY KEY,
+      original_name TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      created_by TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS foodbusiness_processed_logs (
+      message_id TEXT PRIMARY KEY,
+      user_id TEXT,
+      ic_name TEXT NOT NULL,
+      minutes INTEGER NOT NULL,
+      assigned_by TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS foodbusiness_pending_logs (
+      message_id TEXT PRIMARY KEY,
+      ic_name TEXT NOT NULL,
+      normalized_name TEXT NOT NULL,
+      minutes INTEGER NOT NULL,
+      original_text TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS foodbusiness_money_logs (
+      message_id TEXT PRIMARY KEY,
+      amount INTEGER,
+      logged_at TIMESTAMPTZ NOT NULL,
+      original_text TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS foodbusiness_forgot_alerts (
+      user_id TEXT PRIMARY KEY,
+      session_started_at TIMESTAMPTZ NOT NULL,
+      last_alert_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
 
   console.log("✅ Datenbank bereit.");
 }
@@ -2462,7 +2525,35 @@ async function deleteBusinessUserLink(name) {
   return res.rows[0] || null;
 }
 
-function collectEmbedTextForBusinessTimeLog(message) {
+
+// =====================
+// IC-FOODBUSINESS / AUTOMATISCHE DIENSTZEITEN
+// System wie beim CC/Tiki-Bot: Logs erkennen, Im-Dienst-Rolle setzen,
+// Zeiten automatisch buchen und unbekannte Namen sauber zur Zuordnung melden.
+// =====================
+function normalizeFoodBusinessName(name) {
+  return String(name || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/ä/g, "ae")
+    .replace(/ö/g, "oe")
+    .replace(/ü/g, "ue")
+    .replace(/ß/g, "ss")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function stripDiscordPrefix(name) {
+  return String(name || "")
+    .replace(/^[A-ZÄÖÜ]{1,8}\s*\|\s*/i, "")
+    .replace(/^PR\s*[-|]\s*/i, "")
+    .replace(/^Pearls\s*[-|]\s*/i, "")
+    .trim();
+}
+
+function getMessageFullText(message) {
   const parts = [];
 
   if (message.content) parts.push(message.content);
@@ -2481,237 +2572,555 @@ function collectEmbedTextForBusinessTimeLog(message) {
   return parts.join("\n");
 }
 
-function parseBusinessDurationToMinutes(rawDuration) {
-  if (!rawDuration) return null;
+function parseFoodBusinessClockIn(message) {
+  const text = getMessageFullText(message);
 
-  const text = String(rawDuration).toLowerCase();
-  const hours = Number((text.match(/(\d+)\s*stunden?/) || [])[1] || 0);
-  const minutes = Number((text.match(/(\d+)\s*minuten?/) || [])[1] || 0);
-  const seconds = Number((text.match(/(\d+)\s*sekunden?/) || [])[1] || 0);
+  if (!text || !/eingestempelt/i.test(text)) return null;
 
-  const totalMinutes = hours * 60 + minutes + (seconds > 0 ? 1 : 0);
-  return totalMinutes;
-}
+  const nameMatch =
+    text.match(/(.+?)\s*\(ID\s*:?\s*\d+\)\s*hat\s+sich\s+eingestempelt/i) ||
+    text.match(/Der\s+Mitarbeiter\s+(.+?)\s+hat\s+sich\s+eingestempelt/i) ||
+    text.match(/(.+?)\s+hat\s+sich\s+eingestempelt/i);
 
-function parseBusinessTimeLogMessage(message) {
-  const text = collectEmbedTextForBusinessTimeLog(message);
-  if (!text || !text.toLowerCase().includes("business zeitstempel")) return null;
+  if (!nameMatch) return null;
 
-  const employeeMatch = text.match(/Der\s+Mitarbeiter\s+(.+?)\s*\(ID:\s*(\d+)\)\s+hat\s+sich\s+(eingestempelt|ausgestempelt)/i);
-  if (!employeeMatch) return null;
-
-  const durationMatch = text.match(/Dauer:\s*([^\n]+)/i);
-  const action = employeeMatch[3].toLowerCase();
-  const durationText = durationMatch ? durationMatch[1].trim() : null;
+  const rawName = nameMatch[1]
+    .replace(/\*\*/g, "")
+    .replace(/[`*_]/g, "")
+    .replace(/^Der Mitarbeiter\s+/i, "")
+    .replace(/^\s*[:•\-]+/, "")
+    .trim();
 
   return {
-    messageId: message.id,
-    channelId: message.channelId,
-    employeeName: employeeMatch[1].trim(),
-    businessId: employeeMatch[2].trim(),
-    action,
-    durationText,
-    durationMinutes: action === "ausgestempelt" ? parseBusinessDurationToMinutes(durationText) : null,
-    rawText: text.slice(0, 1500),
+    icName: rawName,
+    normalizedName: normalizeFoodBusinessName(rawName),
+    originalText: text.slice(0, 1800),
   };
 }
 
-async function setDutyRoleForUser(userId, enabled) {
-  const guild = await client.guilds.fetch(GUILD_ID).catch(() => null);
-  const member = await guild?.members.fetch(userId).catch(() => null);
-  if (!member) return null;
+function parseFoodBusinessTimeLog(message) {
+  const text = getMessageFullText(message);
 
-  if (enabled) await member.roles.add(DUTY_ROLE_ID, "Automatische Dienst-Erkennung über IC-Foodbusiness").catch(() => null);
-  else await member.roles.remove(DUTY_ROLE_ID, "Automatische Dienst-Erkennung über IC-Foodbusiness").catch(() => null);
+  if (!text || !/ausgestempelt/i.test(text)) return null;
 
-  return member;
+  const nameMatch =
+    text.match(/(.+?)\s*\(ID\s*:?\s*\d+\)\s*hat\s+sich\s+ausgestempelt/i) ||
+    text.match(/Der\s+Mitarbeiter\s+(.+?)\s+hat\s+sich\s+ausgestempelt/i) ||
+    text.match(/(.+?)\s+hat\s+sich\s+ausgestempelt/i);
+
+  const durationMatch =
+    text.match(/Dauer\s*:?\s*(\d+)\s*Stunden?\s*,?\s*(\d+)\s*Minuten?\s*,?\s*([\d,.]+)\s*Sekunden?/i) ||
+    text.match(/(\d+)\s*Stunden?\s*,?\s*(\d+)\s*Minuten?\s*,?\s*([\d,.]+)\s*Sekunden?/i) ||
+    text.match(/Dauer\s*:?\s*(\d+)\s*h\s*(\d+)\s*m\s*([\d,.]+)?\s*s?/i);
+
+  if (!nameMatch || !durationMatch) return null;
+
+  const rawName = nameMatch[1]
+    .replace(/\*\*/g, "")
+    .replace(/[`*_]/g, "")
+    .replace(/^Der Mitarbeiter\s+/i, "")
+    .replace(/^\s*[:•\-]+/, "")
+    .trim();
+
+  const hours = Number(durationMatch[1] || 0);
+  const minutesRaw = Number(durationMatch[2] || 0);
+  const seconds = Number(String(durationMatch[3] || "0").replace(",", "."));
+  const minutes = Math.max(1, hours * 60 + minutesRaw + (seconds >= 30 ? 1 : 0));
+
+  return {
+    messageId: message.id,
+    icName: rawName,
+    normalizedName: normalizeFoodBusinessName(rawName),
+    minutes,
+    originalText: text.slice(0, 1800),
+  };
 }
 
-async function processBusinessClockInFromLog(parsed, linkedUser) {
-  if (!parsed || !linkedUser) return { ok: false, reason: "missing_data" };
+async function findFoodBusinessUser(icName) {
+  const normalized = normalizeFoodBusinessName(icName);
+  if (!normalized) return { userId: null, source: "none", matches: [] };
 
-  await ensureEmployee(linkedUser.user_id);
-  await query(`UPDATE employees SET left_server = FALSE WHERE user_id = $1`, [linkedUser.user_id]).catch(() => null);
+  const mapped = await query(
+    `SELECT user_id FROM foodbusiness_name_mappings WHERE normalized_name = $1 LIMIT 1`,
+    [normalized]
+  ).catch(() => ({ rows: [] }));
+
+  if (mapped.rows[0]?.user_id) {
+    return { userId: mapped.rows[0].user_id, source: "foodbusiness_mapping" };
+  }
+
+  // Alte /business-link Verknüpfungen bleiben kompatibel.
+  const oldMapped = await query(
+    `SELECT user_id FROM business_name_links WHERE name_key = $1 LIMIT 1`,
+    [normalizeBusinessName(icName)]
+  ).catch(() => ({ rows: [] }));
+
+  if (oldMapped.rows[0]?.user_id) {
+    return { userId: oldMapped.rows[0].user_id, source: "business_name_links" };
+  }
+
+  const guild = await client.guilds.fetch(GUILD_ID).catch(() => null);
+  if (!guild) return { userId: null, source: "none", matches: [] };
+
+  const members = await guild.members.fetch().catch(() => null);
+  if (!members) return { userId: null, source: "none", matches: [] };
+
+  const matches = [];
+
+  for (const [, member] of members) {
+    const display = member.nickname || member.user.globalName || member.user.username;
+    const cleanDisplay = stripDiscordPrefix(display);
+    const normalizedDisplay = normalizeFoodBusinessName(cleanDisplay);
+    const normalizedFull = normalizeFoodBusinessName(display);
+
+    if (
+      normalizedDisplay === normalized ||
+      normalizedFull === normalized ||
+      normalizedFull.includes(normalized) ||
+      (normalizedDisplay && normalized.includes(normalizedDisplay))
+    ) {
+      matches.push(member);
+    }
+  }
+
+  if (matches.length === 1) {
+    return { userId: matches[0].id, source: "nickname", matches };
+  }
+
+  return { userId: null, source: matches.length > 1 ? "multiple" : "none", matches };
+}
+
+async function rememberFoodBusinessMapping({ icName, targetUserId, assignedBy = "System" }) {
+  await query(
+    `
+    INSERT INTO foodbusiness_name_mappings (normalized_name, original_name, user_id, created_by, updated_at)
+    VALUES ($1, $2, $3, $4, NOW())
+    ON CONFLICT (normalized_name)
+    DO UPDATE SET user_id = EXCLUDED.user_id,
+                  original_name = EXCLUDED.original_name,
+                  created_by = EXCLUDED.created_by,
+                  updated_at = NOW();
+    `,
+    [normalizeFoodBusinessName(icName), icName, targetUserId, assignedBy]
+  ).catch(() => null);
+}
+
+async function handleFoodBusinessClockIn(message, parsed) {
+  const found = await findFoodBusinessUser(parsed.icName);
+
+  if (!found.userId) {
+    // Beim Einstempeln wird noch keine Zeit gebucht. Wenn keine Zuordnung gefunden wird,
+    // wird spätestens beim Ausstempeln eine Zuordnungsanfrage erstellt.
+    return;
+  }
+
+  await ensureEmployee(found.userId);
+  await query(`UPDATE employees SET left_server = FALSE WHERE user_id = $1`, [found.userId]).catch(() => null);
 
   await query(
     `
     INSERT INTO active_sessions (user_id, started_at)
-    VALUES ($1, NOW())
-    ON CONFLICT (user_id) DO NOTHING;
+    VALUES ($1, $2)
+    ON CONFLICT (user_id)
+    DO UPDATE SET started_at = EXCLUDED.started_at,
+                  pause_started_at = NULL,
+                  paused_ms = 0,
+                  reminder_message_id = NULL,
+                  reminder_sent_at = NULL,
+                  reminder_deadline_at = NULL;
     `,
-    [linkedUser.user_id]
+    [found.userId, message.createdAt || new Date()]
+  ).catch(() => null);
+
+  const guild = await client.guilds.fetch(GUILD_ID).catch(() => null);
+  const member = guild ? await guild.members.fetch(found.userId).catch(() => null) : null;
+
+  if (member) {
+    await member.roles.add(DUTY_ROLE_ID, "Foodbusiness automatisch eingestempelt").catch(() => null);
+  }
+
+  await rememberFoodBusinessMapping({ icName: parsed.icName, targetUserId: found.userId, assignedBy: found.source === "nickname" ? "AUTO_NICKNAME" : "System" });
+
+  const logChannel = await client.channels.fetch(TIME_LOG_CHANNEL_ID).catch(() => null);
+  if (logChannel) {
+    const embed = new EmbedBuilder()
+      .setColor(0x2ecc71)
+      .setTitle("🟢 ・FOODBUSINESS EINGESTEMPELT")
+      .setDescription(
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+          `👤 **IC-Name**\n└ ${parsed.icName}\n\n` +
+          `👥 **Discord-User**\n└ <@${found.userId}>\n\n` +
+          `✅ **Aktion**\n└ Im-Dienst-Rolle wurde vergeben.\n` +
+          "━━━━━━━━━━━━━━━━━━━━━━━━"
+      )
+      .setFooter({ text: "Pearls • Automatische Dienst-Erkennung" })
+      .setTimestamp();
+
+    await logChannel.send({ embeds: [embed] }).catch(() => null);
+  }
+
+  await refreshAllTimeDisplays().catch(() => null);
+}
+
+async function applyFoodBusinessTime({ messageId, targetUserId, icName, minutes, assignedBy = "System" }) {
+  const exists = await query(
+    `SELECT message_id FROM foodbusiness_processed_logs WHERE message_id = $1`,
+    [messageId]
+  ).catch(() => ({ rows: [] }));
+
+  if (exists.rows[0]) return { alreadyProcessed: true };
+
+  await ensureEmployee(targetUserId);
+
+  const activeSession = await query(
+    `SELECT * FROM active_sessions WHERE user_id = $1`,
+    [targetUserId]
+  ).catch(() => ({ rows: [] }));
+
+  const endAt = new Date();
+  const startedAt = activeSession.rows[0]?.started_at
+    ? new Date(activeSession.rows[0].started_at)
+    : new Date(endAt.getTime() - minutes * 60 * 1000);
+
+  await query(
+    `
+    UPDATE employees
+    SET total_minutes = total_minutes + $2,
+        weekly_minutes = weekly_minutes + $2,
+        left_server = FALSE
+    WHERE user_id = $1;
+    `,
+    [targetUserId, minutes]
   );
 
   await query(
     `
-    UPDATE active_sessions
-    SET pause_started_at = NULL,
-        reminder_message_id = NULL,
-        reminder_sent_at = NULL,
-        reminder_deadline_at = NULL
-    WHERE user_id = $1;
+    INSERT INTO work_sessions (user_id, started_at, ended_at, minutes, auto_clockout, corrected)
+    VALUES ($1, $2, $3, $4, FALSE, TRUE);
     `,
-    [linkedUser.user_id]
+    [targetUserId, startedAt, endAt, minutes]
   ).catch(() => null);
 
-  await setDutyRoleForUser(linkedUser.user_id, true);
-  await sendTimeLog("in", `<@${linkedUser.user_id}>`, `Automatisch über IC-Foodbusiness erkannt.\n🧾 Name: **${parsed.employeeName}**`);
-  await refreshAllTimeDisplays();
+  await query(
+    `
+    INSERT INTO foodbusiness_processed_logs (message_id, user_id, ic_name, minutes, assigned_by)
+    VALUES ($1, $2, $3, $4, $5)
+    ON CONFLICT (message_id) DO NOTHING;
+    `,
+    [messageId, targetUserId, icName, minutes, assignedBy]
+  );
 
-  return { ok: true };
+  await query(
+    `
+    INSERT INTO business_time_imports (message_id, user_id, name, business_id, duration_minutes, duration_text, raw_text)
+    VALUES ($1, $2, $3, NULL, $4, $5, $6)
+    ON CONFLICT (message_id) DO NOTHING;
+    `,
+    [messageId, targetUserId, icName, minutes, formatShortMinutes(minutes), `${icName}: ${formatShortMinutes(minutes)}`]
+  ).catch(() => null);
+
+  await query(`DELETE FROM active_sessions WHERE user_id = $1`, [targetUserId]).catch(() => null);
+
+  const guild = await client.guilds.fetch(GUILD_ID).catch(() => null);
+  const member = guild ? await guild.members.fetch(targetUserId).catch(() => null) : null;
+
+  if (member) {
+    await member.roles.remove(DUTY_ROLE_ID, "Foodbusiness automatisch ausgestempelt").catch(() => null);
+  }
+
+  await rememberFoodBusinessMapping({ icName, targetUserId, assignedBy });
+
+  await query(
+    `INSERT INTO personnel_events (user_id, issuer_id, event_type, details) VALUES ($1, $2, $3, $4)`,
+    [
+      targetUserId,
+      assignedBy === "System" || String(assignedBy).startsWith("AUTO") ? null : assignedBy,
+      "Foodbusiness-Zeitlog",
+      `${icName}: ${formatShortMinutes(minutes)} automatisch übernommen`,
+    ]
+  ).catch(() => null);
+
+  await refreshAllTimeDisplays().catch(() => null);
+
+  const logChannel = await client.channels.fetch(TIME_LOG_CHANNEL_ID).catch(() => null);
+  if (logChannel) {
+    const embed = new EmbedBuilder()
+      .setColor(0x2ecc71)
+      .setTitle("🔴 ・FOODBUSINESS AUSGESTEMPELT")
+      .setDescription(
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+          `👤 **IC-Name**\n└ ${icName}\n\n` +
+          `👥 **Discord-User**\n└ <@${targetUserId}>\n\n` +
+          `⏱️ **Arbeitszeit**\n└ ${formatShortMinutes(minutes)}\n\n` +
+          `🔴 **Aktion**\n└ Im-Dienst-Rolle wurde entfernt.\n\n` +
+          `🛠️ **Zuordnung**\n└ ${assignedBy === "System" || String(assignedBy).startsWith("AUTO") ? "Automatisch" : `<@${assignedBy}>`}\n` +
+          "━━━━━━━━━━━━━━━━━━━━━━━━"
+      )
+      .setFooter({ text: "Pearls • Foodbusiness Zeitlog" })
+      .setTimestamp();
+
+    await logChannel.send({ embeds: [embed] }).catch(() => null);
+  }
+
+  return { alreadyProcessed: false, minutes };
 }
 
-async function importBusinessTimeFromLog(parsed, linkedUser) {
-  if (!parsed || !linkedUser) return { ok: false, reason: "missing_data" };
+async function sendFoodBusinessAssignmentRequest({ messageId, icName, normalizedName, minutes, originalText, reason }) {
+  await query(
+    `
+    INSERT INTO foodbusiness_pending_logs (message_id, ic_name, normalized_name, minutes, original_text)
+    VALUES ($1, $2, $3, $4, $5)
+    ON CONFLICT (message_id) DO NOTHING;
+    `,
+    [messageId, icName, normalizedName, minutes, originalText]
+  ).catch(() => null);
 
-  if (parsed.action !== "ausgestempelt") {
-    return { ok: false, reason: "not_clock_out" };
+  const channel = await client.channels.fetch(TIME_LOG_CHANNEL_ID).catch(() => null);
+  if (!channel) return;
+
+  const embed = new EmbedBuilder()
+    .setColor(0xe67e22)
+    .setTitle("⚠️ ・ZEITLOG KONNTE NICHT ZUGEORDNET WERDEN")
+    .setDescription(
+      "━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+        `👤 **IC-Name**\n└ ${icName}\n\n` +
+        `⏱️ **Arbeitszeit**\n└ ${formatShortMinutes(minutes)}\n\n` +
+        `❌ **Grund**\n└ ${reason}\n\n` +
+        "Bitte wählt unten den richtigen Mitarbeiter aus.\n" +
+        "Danach merkt sich der Bot die Zuordnung für zukünftige Logs.\n" +
+        "━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+    .setFooter({ text: `Pearls • Foodbusiness Log-ID: ${messageId}` })
+    .setTimestamp();
+
+  const row = new ActionRowBuilder().addComponents(
+    new UserSelectMenuBuilder()
+      .setCustomId(`fb_assign_${messageId}`)
+      .setPlaceholder("Mitarbeiter auswählen")
+      .setMinValues(1)
+      .setMaxValues(1)
+  );
+
+  await channel.send({
+    content: FOODBUSINESS_ERROR_PING_ROLE_IDS.map((id) => `<@&${id}>`).join(" "),
+    embeds: [embed],
+    components: [row],
+    allowedMentions: { roles: FOODBUSINESS_ERROR_PING_ROLE_IDS },
+  });
+}
+
+async function handleFoodBusinessLogMessage(message) {
+  if (!message.guild || message.channelId !== FOODBUSINESS_TIMELOG_CHANNEL_ID) return;
+  if (message.author?.id === client.user.id) return;
+
+  const clockIn = parseFoodBusinessClockIn(message);
+  if (clockIn) {
+    await handleFoodBusinessClockIn(message, clockIn);
+    return;
   }
 
-  const minutes = Number(parsed.durationMinutes || 0);
-  if (!Number.isFinite(minutes) || minutes <= 0) {
-    return { ok: false, reason: "invalid_duration" };
-  }
+  const parsed = parseFoodBusinessTimeLog(message);
+  if (!parsed) return;
 
-  const db = await pool.connect();
+  const processed = await query(
+    `SELECT message_id FROM foodbusiness_processed_logs WHERE message_id = $1`,
+    [message.id]
+  ).catch(() => ({ rows: [] }));
 
-  try {
-    await db.query("BEGIN");
+  if (processed.rows[0]) return;
 
-    const importRes = await db.query(
-      `
-      INSERT INTO business_time_imports (message_id, user_id, name, business_id, duration_minutes, duration_text, raw_text)
-      VALUES ($1, $2, $3, $4, $5, $6, $7)
-      ON CONFLICT (message_id) DO NOTHING
-      RETURNING message_id;
-      `,
-      [
-        parsed.messageId,
-        linkedUser.user_id,
-        parsed.employeeName,
-        parsed.businessId,
-        minutes,
-        parsed.durationText,
-        parsed.rawText,
-      ]
-    );
+  const found = await findFoodBusinessUser(parsed.icName);
 
-    if (importRes.rowCount === 0) {
-      await db.query("ROLLBACK");
-      return { ok: false, reason: "already_imported" };
-    }
-
-    await db.query(
-      `
-      INSERT INTO employees (user_id, total_minutes, weekly_minutes, left_server)
-      VALUES ($1, $2, $2, FALSE)
-      ON CONFLICT (user_id)
-      DO UPDATE SET
-        total_minutes = employees.total_minutes + EXCLUDED.total_minutes,
-        weekly_minutes = employees.weekly_minutes + EXCLUDED.weekly_minutes,
-        left_server = FALSE;
-      `,
-      [linkedUser.user_id, minutes]
-    );
-
-    await db.query(`DELETE FROM active_sessions WHERE user_id = $1`, [linkedUser.user_id]);
-
-    await db.query(
-      `
-      INSERT INTO work_sessions (user_id, started_at, ended_at, minutes, auto_clockout, corrected)
-      VALUES ($1, NOW() - ($2::int * INTERVAL '1 minute'), NOW(), $2, FALSE, TRUE);
-      `,
-      [linkedUser.user_id, minutes]
-    );
-
-    await db.query("COMMIT");
-
-    await setDutyRoleForUser(linkedUser.user_id, false);
-    await sendTimeLog("out", `<@${linkedUser.user_id}>`, `Automatisch über IC-Foodbusiness erkannt.\n🕒 Gespeicherte Arbeitszeit: **${formatShortMinutes(minutes)}**\n🧾 Name: **${parsed.employeeName}**`);
-
-    console.log("✅ Business-Zeit automatisch eingetragen:", {
-      name: parsed.employeeName,
-      userId: linkedUser.user_id,
-      minutes,
-      messageId: parsed.messageId,
+  if (found.userId) {
+    await applyFoodBusinessTime({
+      messageId: message.id,
+      targetUserId: found.userId,
+      icName: parsed.icName,
+      minutes: parsed.minutes,
+      assignedBy: found.source === "nickname" ? "AUTO_NICKNAME" : "System",
     });
+    return;
+  }
 
-    return { ok: true, minutes };
-  } catch (err) {
-    await db.query("ROLLBACK").catch(() => null);
-    console.error("❌ Business-Zeit konnte nicht importiert werden:", err);
-    return { ok: false, reason: "db_error", error: err };
-  } finally {
-    db.release();
+  const reason =
+    found.source === "multiple"
+      ? "Mehrere mögliche Discord-User gefunden."
+      : "Kein eindeutiger Discord-User gefunden.";
+
+  await sendFoodBusinessAssignmentRequest({
+    messageId: message.id,
+    icName: parsed.icName,
+    normalizedName: parsed.normalizedName,
+    minutes: parsed.minutes,
+    originalText: parsed.originalText,
+    reason,
+  });
+}
+
+function parseFoodBusinessMoneyLog(message) {
+  const text = getMessageFullText(message);
+  if (!text || !/NPC-Verkauf/i.test(text)) return null;
+
+  const amountMatch = text.match(/\[\+\]\s*(\d+)\s*\$?/i) || text.match(/\+\s*(\d+)\s*\$?/i);
+  const dateMatch = text.match(/(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}(?::\d{2})?)/);
+
+  let loggedAt = new Date();
+  if (dateMatch) {
+    const time = dateMatch[2].length === 5 ? `${dateMatch[2]}:00` : dateMatch[2];
+    loggedAt = new Date(`${dateMatch[1]}T${time}+02:00`);
+  }
+
+  return {
+    amount: amountMatch ? Number(amountMatch[1]) : null,
+    loggedAt,
+    originalText: text.slice(0, 1800),
+  };
+}
+
+async function handleFoodBusinessMoneyLogMessage(message) {
+  if (!message.guild || message.channelId !== FOODBUSINESS_MONEY_LOG_CHANNEL_ID) return;
+  if (message.author?.id === client.user.id) return;
+
+  const parsed = parseFoodBusinessMoneyLog(message);
+  if (!parsed) return;
+
+  await query(
+    `
+    INSERT INTO foodbusiness_money_logs (message_id, amount, logged_at, original_text)
+    VALUES ($1, $2, $3, $4)
+    ON CONFLICT (message_id) DO NOTHING;
+    `,
+    [message.id, parsed.amount, parsed.loggedAt, parsed.originalText]
+  ).catch(() => null);
+
+  await setSetting("last_foodbusiness_money_log_at", parsed.loggedAt.toISOString()).catch(() => null);
+}
+
+async function stopFoodBusinessDutyOnly(userId, reason = "Foodbusiness automatisch beendet") {
+  await query(`DELETE FROM active_sessions WHERE user_id = $1`, [userId]).catch(() => null);
+
+  const guild = await client.guilds.fetch(GUILD_ID).catch(() => null);
+  const member = guild ? await guild.members.fetch(userId).catch(() => null) : null;
+
+  if (member) {
+    await member.roles.remove(DUTY_ROLE_ID, reason).catch(() => null);
+  }
+
+  await refreshAllTimeDisplays().catch(() => null);
+}
+
+async function sendForgotClockoutAlert({ userId, startedAt, lastMoneyLogAt, mode }) {
+  const oldAlert = await query(
+    `SELECT * FROM foodbusiness_forgot_alerts WHERE user_id = $1 AND session_started_at = $2`,
+    [userId, startedAt]
+  ).catch(() => ({ rows: [] }));
+
+  if (oldAlert.rows[0]) return;
+
+  await query(
+    `
+    INSERT INTO foodbusiness_forgot_alerts (user_id, session_started_at)
+    VALUES ($1, $2)
+    ON CONFLICT (user_id) DO UPDATE SET session_started_at = EXCLUDED.session_started_at, last_alert_at = NOW();
+    `,
+    [userId, startedAt]
+  ).catch(() => null);
+
+  const channel = await client.channels.fetch(TIME_LOG_CHANNEL_ID).catch(() => null);
+  if (!channel) return;
+
+  const lastMoneyText = lastMoneyLogAt
+    ? `<t:${Math.floor(new Date(lastMoneyLogAt).getTime() / 1000)}:R>`
+    : "Kein NPC-Verkauf nach Dienstbeginn gefunden.";
+
+  const embed = new EmbedBuilder()
+    .setColor(0xe67e22)
+    .setTitle("⚠️ ・MÖGLICHES AUSSTEMPELN VERGESSEN")
+    .setDescription(
+      "━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+        `👤 **Mitarbeiter**\n└ <@${userId}>\n\n` +
+        `🟢 **Eingestempelt seit**\n└ <t:${Math.floor(new Date(startedAt).getTime() / 1000)}:F>\n\n` +
+        `💰 **Letzter NPC-Verkauf**\n└ ${lastMoneyText}\n\n` +
+        `🛡️ **Sicherheitsmodus**\n└ ${mode}\n\n` +
+        "Bitte prüfen, ob die Person vergessen hat auszustempeln.\n" +
+        "━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+    .setFooter({ text: "Pearls • Foodbusiness Sicherheitsprüfung" })
+    .setTimestamp();
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`fb_force_duty_end_${userId}`)
+      .setLabel("Dienst beenden")
+      .setEmoji("🔴")
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  await channel.send({
+    content: FOODBUSINESS_ERROR_PING_ROLE_IDS.map((id) => `<@&${id}>`).join(" "),
+    embeds: [embed],
+    components: [row],
+    allowedMentions: { roles: FOODBUSINESS_ERROR_PING_ROLE_IDS },
+  });
+}
+
+async function checkForgotFoodBusinessClockouts() {
+  const active = await query(`SELECT * FROM active_sessions`).catch(() => ({ rows: [] }));
+  if (!active.rows.length) return;
+
+  const now = Date.now();
+  const lastMoney = await query(
+    `SELECT logged_at FROM foodbusiness_money_logs ORDER BY logged_at DESC LIMIT 1`
+  ).catch(() => ({ rows: [] }));
+
+  const lastMoneyAt = lastMoney.rows[0]?.logged_at ? new Date(lastMoney.rows[0].logged_at) : null;
+
+  for (const session of active.rows) {
+    const startedAt = new Date(session.started_at);
+    const activeMs = now - startedAt.getTime();
+    if (activeMs < FOODBIZ_FORGOT_CHECK_AFTER_MS) continue;
+
+    const moneyAfterStart = lastMoneyAt && lastMoneyAt.getTime() >= startedAt.getTime();
+    const moneyIdle = lastMoneyAt && now - lastMoneyAt.getTime() >= FOODBIZ_MONEY_IDLE_MS;
+
+    if (active.rows.length === 1 && moneyAfterStart && moneyIdle) {
+      await stopFoodBusinessDutyOnly(session.user_id, "Foodbusiness Sicherheits-Autoausstempelung");
+
+      const channel = await client.channels.fetch(TIME_LOG_CHANNEL_ID).catch(() => null);
+      if (channel) {
+        const embed = new EmbedBuilder()
+          .setColor(0xe74c3c)
+          .setTitle("🔴 ・DIENST AUTOMATISCH BEENDET")
+          .setDescription(
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+              `👤 **Mitarbeiter**\n└ <@${session.user_id}>\n\n` +
+              `🟢 **Eingestempelt seit**\n└ <t:${Math.floor(startedAt.getTime() / 1000)}:F>\n\n` +
+              `💰 **Letzter NPC-Verkauf**\n└ <t:${Math.floor(lastMoneyAt.getTime() / 1000)}:F>\n\n` +
+              "Die Im-Dienst-Rolle wurde entfernt. Es wurde **keine zusätzliche Zeit** gebucht, weil kein Foodbusiness-Ausstempel-Log vorhanden war.\n" +
+              "━━━━━━━━━━━━━━━━━━━━━━━━"
+          )
+          .setFooter({ text: "Pearls • Sicherheits-Autoausstempelung" })
+          .setTimestamp();
+
+        await channel.send({ embeds: [embed] }).catch(() => null);
+      }
+    } else {
+      await sendForgotClockoutAlert({
+        userId: session.user_id,
+        startedAt: session.started_at,
+        lastMoneyLogAt: lastMoneyAt,
+        mode: active.rows.length > 1 ? "Mehrere Personen im Dienst — keine automatische Buchung." : "Keine sichere Auto-Erkennung möglich.",
+      });
+    }
   }
 }
 
 client.on("messageCreate", async (message) => {
   try {
-    if (!message.guildId) return;
-
-    if (message.channelId === MONEY_LOG_CHANNEL_ID) {
-      console.log("💸 Geld-Log erkannt:", {
-        messageId: message.id,
-        channelId: message.channelId,
-        preview: collectEmbedTextForBusinessTimeLog(message).slice(0, 500),
-      });
-      return;
-    }
-
-    if (message.channelId !== BUSINESS_TIME_LOG_CHANNEL_ID) return;
-
-    const parsed = parseBusinessTimeLogMessage(message);
-
-    console.log("📩 Neue Nachricht im Business-Zeitlog-Channel erkannt:", {
-      messageId: message.id,
-      authorId: message.author?.id,
-      authorIsBot: Boolean(message.author?.bot),
-      contentLength: message.content?.length || 0,
-      embedCount: message.embeds?.length || 0,
-      preview: collectEmbedTextForBusinessTimeLog(message).slice(0, 700),
-    });
-
-    if (!parsed) {
-      console.log("⚠️ Business-Zeitlog konnte noch nicht geparst werden. Parser muss an das genaue Format angepasst werden.");
-      return;
-    }
-
-    const linkedUser = await getBusinessUserLink(parsed.employeeName);
-
-    console.log("✅ Business-Zeitlog erkannt:", {
-      name: parsed.employeeName,
-      businessId: parsed.businessId,
-      action: parsed.action,
-      durationText: parsed.durationText,
-      durationMinutes: parsed.durationMinutes,
-      linkedDiscordUserId: linkedUser?.user_id || null,
-    });
-
-    if (!linkedUser) {
-      console.log(`ℹ️ Business-Name "${parsed.employeeName}" ist noch nicht verknüpft. Nutze /business-link user:@User name:${parsed.employeeName}`);
-      return;
-    }
-
-    if (parsed.action === "eingestempelt") {
-      const result = await processBusinessClockInFromLog(parsed, linkedUser);
-      if (!result.ok) console.log("ℹ️ Business-Einstempelung wurde nicht übernommen:", result.reason);
-      return;
-    }
-
-    if (parsed.action === "ausgestempelt") {
-      const importResult = await importBusinessTimeFromLog(parsed, linkedUser);
-
-      if (importResult.ok) {
-        await updateTotalWorktimeMessage().catch((err) => console.error("⚠️ Gesamtzeit konnte nach Business-Import nicht aktualisiert werden:", err));
-        await updateWeeklyWorktimeMessage().catch((err) => console.error("⚠️ Wochenzeit konnte nach Business-Import nicht aktualisiert werden:", err));
-        await updateDashboardMessage().catch((err) => console.error("⚠️ Dashboard konnte nach Business-Import nicht aktualisiert werden:", err));
-      } else {
-        console.log("ℹ️ Business-Zeit wurde nicht eingetragen:", importResult.reason);
-      }
-    }
+    await handleFoodBusinessMoneyLogMessage(message);
+    await handleFoodBusinessLogMessage(message);
   } catch (err) {
-    console.error("❌ Fehler beim Business-Zeitlog-Scanner:", err);
+    console.error("❌ Fehler beim Foodbusiness-Log:", err);
   }
 });
 
@@ -2897,6 +3306,7 @@ async function startBotOnce() {
     setInterval(sendStockCheckReminderIfNeeded, 60 * 1000);
     setInterval(weeklyResetOnly, 60 * 1000);
     setInterval(checkWarningReviewReminders, 60 * 60 * 1000);
+    setInterval(checkForgotFoodBusinessClockouts, 5 * 60 * 1000);
 
     console.log("✅ Automatisches Dienstzeit-System gestartet.");
   } catch (err) {
@@ -3315,6 +3725,69 @@ client.on("interactionCreate", async (interaction) => {
     if (interaction.isUserSelectMenu()) {
       const id = interaction.customId;
 
+      if (id.startsWith("fb_assign_")) {
+        if (!canManagePersonal(interaction.member)) {
+          return interaction.reply({ content: "❌ Du darfst diese Zeit nicht zuordnen.", ephemeral: true });
+        }
+
+        await interaction.deferReply({ ephemeral: true });
+
+        const messageId = id.replace("fb_assign_", "");
+        const targetUserId = interaction.values?.[0];
+
+        const pending = await query(
+          `SELECT * FROM foodbusiness_pending_logs WHERE message_id = $1`,
+          [messageId]
+        ).catch(() => ({ rows: [] }));
+
+        const log = pending.rows[0];
+
+        if (!log) {
+          return interaction.editReply({
+            content: "❌ Dieser Foodbusiness-Zeitlog wurde nicht gefunden oder bereits verarbeitet.",
+          });
+        }
+
+        const result = await applyFoodBusinessTime({
+          messageId,
+          targetUserId,
+          icName: log.ic_name,
+          minutes: Number(log.minutes || 0),
+          assignedBy: interaction.user.id,
+        });
+
+        if (result.alreadyProcessed) {
+          return interaction.editReply({ content: "❌ Diese Arbeitszeit wurde bereits übernommen." });
+        }
+
+        await query(`DELETE FROM foodbusiness_pending_logs WHERE message_id = $1`, [messageId]).catch(() => null);
+
+        const oldEmbed = interaction.message.embeds[0];
+        if (oldEmbed) {
+          const embed = EmbedBuilder.from(oldEmbed)
+            .setColor(0x2ecc71)
+            .setTitle("✅ ・ZEITLOG ZUGEORDNET")
+            .setDescription(
+              "━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                `👤 **IC-Name**\n└ ${log.ic_name}\n\n` +
+                `👥 **Zugeordnet zu**\n└ <@${targetUserId}>\n\n` +
+                `⏱️ **Arbeitszeit**\n└ ${formatShortMinutes(Number(log.minutes || 0))}\n\n` +
+                `🛠️ **Zugeordnet von**\n└ <@${interaction.user.id}>\n` +
+                "━━━━━━━━━━━━━━━━━━━━━━━━"
+            )
+            .setFooter({ text: "Pearls • Foodbusiness-Zuordnung gespeichert" })
+            .setTimestamp();
+
+          await interaction.message.edit({ embeds: [embed], components: [] }).catch(() => null);
+        } else {
+          await interaction.message.edit({ components: [] }).catch(() => null);
+        }
+
+        return interaction.editReply({
+          content: `✅ Zeit wurde <@${targetUserId}> gutgeschrieben und für zukünftige Logs gemerkt.`,
+        });
+      }
+
       if (
         id === "time_add_user" ||
         id === "time_remove_user" ||
@@ -3468,6 +3941,27 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     if (interaction.isButton()) {
+      if (interaction.customId.startsWith("fb_force_duty_end_")) {
+        if (!canManagePersonal(interaction.member)) {
+          return interaction.reply({ content: "❌ Du darfst den Dienst nicht manuell beenden.", ephemeral: true });
+        }
+
+        const userId = interaction.customId.replace("fb_force_duty_end_", "");
+        await stopFoodBusinessDutyOnly(userId, `Foodbusiness Dienst manuell beendet von ${interaction.user.id}`);
+
+        const oldEmbed = interaction.message.embeds[0];
+        if (oldEmbed) {
+          const embed = EmbedBuilder.from(oldEmbed)
+            .setColor(0x95a5a6)
+            .setTitle("🔴 ・DIENST MANUELL BEENDET")
+            .addFields({ name: "Bearbeitet von", value: `<@${interaction.user.id}>` })
+            .setTimestamp();
+          return interaction.update({ embeds: [embed], components: [] });
+        }
+
+        return interaction.update({ content: `✅ Dienst von <@${userId}> wurde beendet.`, components: [] });
+      }
+
       if (interaction.customId === "mgmt_time_start") {
         if (!canManagePersonal(interaction.member)) {
           return interaction.reply({ content: "❌ Du darfst die Zeitverwaltung nicht nutzen.", ephemeral: true });
