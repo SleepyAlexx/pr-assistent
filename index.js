@@ -154,6 +154,25 @@ const REMINDER_AFTER_MS = 2 * 60 * 60 * 1000;
 const REMINDER_RESPONSE_MS = 10 * 60 * 1000;
 const LEADERBOARD_PAGE_SIZE = 7;
 
+// =====================
+// KOSTEN-SPAR-MODUS
+// =====================
+// Automatische Foodbusiness-/Geldlog-Dienstzeiterkennung ist deaktiviert,
+// weil sie dauerhaft Logs überwacht und unnötige Railway-Kosten verursachen kann.
+// Zeiten können weiterhin manuell über Zeitverwaltung, /dienst-korrektur und /dienst-reset gepflegt werden.
+const COST_SAVING_MODE = true;
+const ENABLE_AUTOMATIC_FOODBIZ_TIME = false;
+const ENABLE_FOODBIZ_MONEY_MONITORING = false;
+
+// Weniger automatische Aktualisierungen = weniger Datenbank-/Discord-Arbeit.
+const TIME_DISPLAY_REFRESH_MS = 15 * 60 * 1000;
+const DASHBOARD_REFRESH_MS = 15 * 60 * 1000;
+const WEEKLY_STATISTICS_REFRESH_MS = 30 * 60 * 1000;
+const MANAGEMENT_TASKS_REFRESH_MS = 30 * 60 * 1000;
+const STOCK_CHECK_REMINDER_MS = 30 * 60 * 1000;
+const WEEKLY_RESET_CHECK_MS = 5 * 60 * 1000;
+const STATUS_ROTATION_MS = 5 * 60 * 1000;
+
 const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: process.env.NODE_ENV === "production" ? { rejectUnauthorized: false } : false,
@@ -3232,6 +3251,8 @@ async function sendForgotClockoutAlert({ userId, startedAt, lastMoneyLogAt, mode
 }
 
 async function checkForgotFoodBusinessClockouts() {
+  if (!ENABLE_AUTOMATIC_FOODBIZ_TIME && !ENABLE_FOODBIZ_MONEY_MONITORING) return;
+
   const active = await query(`SELECT * FROM active_sessions`).catch(() => ({ rows: [] }));
   if (!active.rows.length) return;
 
@@ -3283,9 +3304,18 @@ async function checkForgotFoodBusinessClockouts() {
 }
 
 client.on("messageCreate", async (message) => {
+  // Kosten-Spar-Modus: Keine automatische Foodbusiness-/Geldlog-Überwachung.
+  // Dadurch verarbeitet der Bot nicht mehr jede Log-Nachricht dauerhaft im Hintergrund.
+  if (!ENABLE_AUTOMATIC_FOODBIZ_TIME && !ENABLE_FOODBIZ_MONEY_MONITORING) return;
+
   try {
-    await handleFoodBusinessMoneyLogMessage(message);
-    await handleFoodBusinessLogMessage(message);
+    if (ENABLE_FOODBIZ_MONEY_MONITORING) {
+      await handleFoodBusinessMoneyLogMessage(message);
+    }
+
+    if (ENABLE_AUTOMATIC_FOODBIZ_TIME) {
+      await handleFoodBusinessLogMessage(message);
+    }
   } catch (err) {
     console.error("❌ Fehler beim Foodbusiness-Log:", err);
   }
@@ -3547,7 +3577,7 @@ function startStatusRotation() {
   };
 
   applyStatus();
-  statusRotationInterval = setInterval(applyStatus, 5000);
+  statusRotationInterval = setInterval(applyStatus, STATUS_ROTATION_MS);
 }
 
 let botStarted = false;
@@ -3575,20 +3605,25 @@ async function startBotOnce() {
     await updateDashboardMessage();
     await updateWeeklyStatisticsMessage();
     await updateManagementTasksMessage();
-    await sendStockCheckReminderIfNeeded(true);
+    await sendStockCheckReminderIfNeeded(false);
 
-    // Altes manuelles Aktivitäts-/Reminder-System ist deaktiviert. Dienstzeiten laufen über IC-Foodbusiness-Logs.
-    setInterval(updateTotalWorktimeMessage, 2 * 60 * 1000);
-    setInterval(updateWeeklyWorktimeMessage, 2 * 60 * 1000);
-    setInterval(updateDashboardMessage, 2 * 60 * 1000);
-    setInterval(updateWeeklyStatisticsMessage, 5 * 60 * 1000);
-    setInterval(updateManagementTasksMessage, 5 * 60 * 1000);
-    setInterval(sendStockCheckReminderIfNeeded, 60 * 1000);
-    setInterval(weeklyResetOnly, 60 * 1000);
+    // Kosten-Spar-Modus: automatische Dauer-Updates deutlich reduziert.
+    // Das Foodbusiness-Auto-Zeitsystem ist deaktiviert; manuelle Zeitverwaltung bleibt aktiv.
+    setInterval(updateTotalWorktimeMessage, TIME_DISPLAY_REFRESH_MS);
+    setInterval(updateWeeklyWorktimeMessage, TIME_DISPLAY_REFRESH_MS);
+    setInterval(updateDashboardMessage, DASHBOARD_REFRESH_MS);
+    setInterval(updateWeeklyStatisticsMessage, WEEKLY_STATISTICS_REFRESH_MS);
+    setInterval(updateManagementTasksMessage, MANAGEMENT_TASKS_REFRESH_MS);
+    setInterval(sendStockCheckReminderIfNeeded, STOCK_CHECK_REMINDER_MS);
+    setInterval(weeklyResetOnly, WEEKLY_RESET_CHECK_MS);
     setInterval(checkWarningReviewReminders, 60 * 60 * 1000);
-    setInterval(checkForgotFoodBusinessClockouts, 5 * 60 * 1000);
 
-    console.log("✅ Automatisches Dienstzeit-System gestartet.");
+    if (ENABLE_AUTOMATIC_FOODBIZ_TIME || ENABLE_FOODBIZ_MONEY_MONITORING) {
+      setInterval(checkForgotFoodBusinessClockouts, 15 * 60 * 1000);
+      console.log("✅ Automatisches Foodbusiness-Dienstzeit-System ist aktiv.");
+    } else {
+      console.log("💸 Kosten-Spar-Modus aktiv: Foodbusiness-Autozeiten/Geldlog-Überwachung sind deaktiviert.");
+    }
   } catch (err) {
     console.error("❌ Fehler beim Start:", err);
   }
